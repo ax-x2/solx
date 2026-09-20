@@ -1,0 +1,26 @@
+# ~/.sol/config.toml - do not put passwords or private keys here
+vault = "~/.sol/vault.enc"
+mode = "cli"
+
+[rpc]
+url = "https://api.mainnet-beta.solana.com"
+cluster = "mainnet"
+timeout_secs = 15
+
+[security]
+confirm_every_transaction = true
+show_details = true
+simulate_before_send = true
+show_simulation = true
+optimize_compute_units = true
+compute_unit_margin_percent = 10
+cache_unlocked_in_shell = true
+
+[history]
+fetch_on_start = false
+# interval_secs = 60  # checked between shell commands
+wallets = []
+limit = 10
+
+[aliases]
+# x1 = ["list", "--wallet", "main"]

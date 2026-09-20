@@ -1,0 +1,5 @@
+/target
+/.sol/
+/config.toml
+/*.enc
+Cargo.lock

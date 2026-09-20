@@ -1,0 +1,35 @@
+[package]
+name = "solx"
+description = "solana local encrypted wallet"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+repository = "https://github.com/ax-x2/solx"
+homepage = "https://1000x.sh"
+
+[dependencies]
+aes-gcm-siv = "0.11.1"
+base64 = "0.22.1"
+bip39 = "2.2.2"
+bs58 = "0.5.1"
+ed25519-dalek-bip32 = "0.3.0"
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
+getrandom = "0.2.17"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7.5.4"
+scrypt = { version = "0.10.0", default-features = false }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+solana-message = { version = "4.6.0", default-features = false, features = ["wincode"] }
+solana-pubkey = { version = "4.3.0", default-features = false, features = ["curve25519"] }
+solana-transaction = { version = "4.3.0", default-features = false, features = ["wincode"] }
+toml = "0.8.23"
+wincode = "0.6.1"
+zeroize = "1.9.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[profile.release]
+strip = "symbols"
