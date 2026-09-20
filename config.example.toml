@@ -1,5 +1,5 @@
-# ~/.sol/config.toml - do not put passwords or private keys here
-vault = "~/.sol/vault.enc"
+# ~/.solx/config.toml - do not put passwords or private keys here
+vault = "~/.solx/vault.enc"
 mode = "cli"
 
 [rpc]
