@@ -43,8 +43,30 @@ impl App {
     fn vault(&mut self) -> Result<Vault> {
         self.unlock()?.load()
     }
-    fn save_vault(&mut self, vault: &Vault) -> Result<()> {
+    fn save_vault(&mut self, vault: &mut Vault) -> Result<()> {
         self.unlock()?.save(vault)
+    }
+
+    fn remember_recipient(&mut self, target: &solana_pubkey::Pubkey) {
+        let result = (|| -> Result<()> {
+            let mut vault = self.vault()?;
+            if !vault.is_known_recipient(target) {
+                vault.remember_recipient(target);
+                self.save_vault(&mut vault)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("Transfer confirmed, but could not remember recipient: {error}");
+        }
+    }
+
+    fn with_session<T>(&mut self, operation: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let result = operation(self);
+        if !self.config.security.cache_unlocked_in_shell {
+            self.session = None;
+        }
+        result
     }
     fn rpc(&self) -> Result<rpc::Rpc> {
         rpc::Rpc::new(&self.config)
@@ -52,21 +74,27 @@ impl App {
 
     fn dispatch(&mut self, words: &[String]) -> Result<()> {
         let words = Zeroizing::new(self.config.expand_alias(words)?);
-        let Some(command) = words.first() else {
-            return Ok(());
-        };
-        let plugin = commands::PLUGINS
-            .iter()
-            .find(|p| p.name == command)
-            .ok_or_else(|| format!("unknown command '{command}'; use 'help'"))?;
-        let result = (plugin.run)(self, &words[1..]);
-        if self.shell && !self.config.security.cache_unlocked_in_shell {
-            self.session = None;
-        }
-        result
+        self.dispatch_resolved(&words)
+    }
+
+    fn dispatch_resolved(&mut self, words: &[String]) -> Result<()> {
+        self.with_session(|app| {
+            let Some(command) = words.first() else {
+                return Ok(());
+            };
+            let plugin = commands::PLUGINS
+                .iter()
+                .find(|p| p.name == command)
+                .ok_or_else(|| format!("unknown command '{command}'; use 'help'"))?;
+            (plugin.run)(app, &words[1..])
+        })
     }
 
     fn refresh_history(&mut self, force: bool) -> Result<()> {
+        self.with_session(|app| app.refresh_history_inner(force))
+    }
+
+    fn refresh_history_inner(&mut self, force: bool) -> Result<()> {
         let history = &self.config.history;
         if !force {
             let Some(interval) = history.interval_secs else {
@@ -86,9 +114,17 @@ impl App {
         let limit = history.limit;
         self.last_history = Some(Instant::now());
         let vault = self.vault()?;
-        let rpc = self.rpc()?;
+        let mut rpc = None;
         for name in wallets {
+            if !vault.contains(&name) {
+                eprintln!("History: skipping unknown wallet '{name}'.");
+                continue;
+            }
             let account = vault.account(&name)?;
+            let rpc = match &rpc {
+                Some(rpc) => rpc,
+                None => rpc.insert(self.rpc()?),
+            };
             let rows = rpc.signatures(&account.pubkey, limit)?;
             println!("History for {name} ({}):", account.pubkey);
             commands::print_history(&rows);
@@ -122,7 +158,6 @@ impl App {
                 }
             };
             let line = Zeroizing::new(line);
-            history.remember(&line);
             let words = Zeroizing::new(
                 line.split_whitespace()
                     .map(str::to_owned)
@@ -131,7 +166,9 @@ impl App {
             if matches!(words.first().map(String::as_str), Some("exit" | "quit")) {
                 break;
             }
-            if let Err(error) = self.dispatch(&words) {
+            let words = Zeroizing::new(self.config.expand_alias(&words)?);
+            history.remember(&line, &words);
+            if let Err(error) = self.dispatch_resolved(&words) {
                 eprintln!("Error: {error}");
             }
         }
@@ -218,5 +255,47 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(cached: bool) -> App {
+        let mut config = Config::default();
+        config.security.cache_unlocked_in_shell = cached;
+        // An empty path always fails to load, without reading any user's wallet.
+        config.vault = PathBuf::new();
+        App {
+            config,
+            config_path: PathBuf::new(),
+            session: Some(Session::test_session(std::path::Path::new(""))),
+            shell: true,
+            last_history: None,
+        }
+    }
+
+    #[test]
+    fn session_cleanup_covers_command_and_history_result_paths() {
+        let mut success = app(false);
+        success.dispatch(&[]).unwrap();
+        assert!(success.session.is_none());
+        let mut failure = app(false);
+        assert!(failure.dispatch(&["unknown".into()]).is_err());
+        assert!(failure.session.is_none());
+        let mut history = app(false);
+        history.refresh_history(true).unwrap();
+        assert!(history.session.is_none());
+        for force in [false, true] {
+            let mut history = app(false);
+            history.config.history.wallets.push("main".into());
+            history.config.history.interval_secs = Some(10);
+            assert!(history.refresh_history(force).is_err());
+            assert!(history.session.is_none());
+        }
+        let mut cached = app(true);
+        cached.dispatch(&[]).unwrap();
+        assert!(cached.session.is_some());
     }
 }

@@ -8,13 +8,13 @@ use ed25519_dalek_bip32::{ChildIndex, ExtendedSigningKey};
 use solana_pubkey::Pubkey;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"SOLX";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const HEADER_LEN: usize = 33;
 const MAX_FILE: u64 = 1024 * 1024;
 const MAX_ACCOUNTS: usize = 128;
@@ -23,6 +23,14 @@ const MAX_RECIPIENTS: usize = 256;
 
 pub struct Master {
     entropy: Zeroizing<Vec<u8>>,
+    next_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPhraseUse {
+    ImportedKey,
+    Shared,
+    UnusedAfterDeletion,
 }
 
 pub enum AccountKind {
@@ -41,6 +49,8 @@ pub struct Vault {
     masters: Vec<Master>,
     pub accounts: Vec<Account>,
     recipients: Vec<[u8; 32]>,
+    // Ciphertext loaded from disk, used to reject stale read/modify/write operations.
+    source_bytes: Option<Vec<u8>>,
 }
 
 struct LockedKey {
@@ -88,7 +98,20 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn create(path: &Path, password: &str, vault: &Vault) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn test_session(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            salt: [1; 16],
+            key: LockedKey {
+                key: Box::new(Zeroizing::new([2; 32])),
+                #[cfg(unix)]
+                locked: false,
+            },
+        }
+    }
+
+    pub fn create(path: &Path, password: &str, vault: &mut Vault) -> Result<Self> {
         if path.exists() {
             return fail("vault already exists");
         }
@@ -105,7 +128,9 @@ impl Session {
 
     pub fn open(path: &Path, password: &str) -> Result<Self> {
         let encrypted = read_private_file(path)?;
-        if encrypted.len() < HEADER_LEN + 16 || &encrypted[..4] != MAGIC || encrypted[4] != VERSION
+        if encrypted.len() < HEADER_LEN + 16
+            || &encrypted[..4] != MAGIC
+            || !matches!(encrypted[4], 1 | VERSION)
         {
             return fail("unsupported or corrupt vault");
         }
@@ -127,7 +152,7 @@ impl Session {
     fn decrypt_bytes(&self, encrypted: Vec<u8>) -> Result<Vault> {
         if encrypted.len() < HEADER_LEN + 16
             || &encrypted[..4] != MAGIC
-            || encrypted[4] != VERSION
+            || !matches!(encrypted[4], 1 | VERSION)
             || encrypted[5..21] != self.salt
         {
             return fail("unsupported or corrupt vault");
@@ -143,10 +168,12 @@ impl Session {
                 &mut *plain,
             )
             .map_err(|_| "wrong password or vault authentication failed")?;
-        Vault::decode(&plain)
+        let mut vault = Vault::decode(&plain, encrypted[4])?;
+        vault.source_bytes = Some(encrypted);
+        Ok(vault)
     }
 
-    pub fn save(&self, vault: &Vault) -> Result<()> {
+    pub fn save(&self, vault: &mut Vault) -> Result<()> {
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce).map_err(|_| "OS randomness unavailable")?;
         let mut header = [0u8; HEADER_LEN];
@@ -159,21 +186,39 @@ impl Session {
         cipher
             .encrypt_in_place(Nonce::from_slice(&nonce), &header, &mut *plain)
             .map_err(|_| "vault encryption failed")?;
+        let mut encrypted = Vec::with_capacity(HEADER_LEN + plain.len());
+        encrypted.extend_from_slice(&header);
+        encrypted.extend_from_slice(&plain);
         let parent = self
             .path
             .parent()
             .ok_or("vault path needs a parent directory")?;
         create_private_dir(parent)?;
+        let _lock = lock_vault(&self.path)?;
+        match &vault.source_bytes {
+            Some(original) => {
+                if read_private_file(&self.path)? != *original {
+                    return fail("vault changed; reload and retry the local operation");
+                }
+            }
+            None => match fs::symlink_metadata(&self.path) {
+                Ok(_) => return fail("vault already exists"),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+        }
         let mut random = [0u8; 8];
         getrandom::getrandom(&mut random).map_err(|_| "OS randomness unavailable")?;
         let tmp = parent.join(format!(".vault-{:016x}.tmp", u64::from_le_bytes(random)));
         let result = (|| -> Result<()> {
             let mut file = private_file(&tmp)?;
-            file.write_all(&header)?;
-            file.write_all(&plain)?;
+            file.write_all(&encrypted)?;
             file.sync_all()?;
             fs::rename(&tmp, &self.path)?;
-            File::open(parent)?.sync_all()?;
+            vault.source_bytes = Some(encrypted);
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("vault saved, but directory sync failed: {error}"))?;
             Ok(())
         })();
         if result.is_err() {
@@ -181,6 +226,28 @@ impl Session {
         }
         result
     }
+}
+
+fn lock_vault(path: &Path) -> Result<File> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(Path::new(&name))?;
+    if !file.metadata()?.is_file() {
+        return fail("vault lock must be a regular file");
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => fail("vault is busy; retry"),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+    // The file remains on disk: unlinking it could give other writers a different lock.
 }
 
 fn read_private_file(path: &Path) -> Result<Vec<u8>> {
@@ -257,6 +324,69 @@ impl Vault {
             .map(|a| a.name.as_str())
             .ok_or_else(|| "vault has no accounts".into())
     }
+
+    pub fn name_or_first<'a>(&'a self, name: Option<&'a str>) -> Result<&'a str> {
+        match name {
+            Some(name) => Ok(name),
+            None => self.first_name(),
+        }
+    }
+
+    pub fn recovery_phrase_use(&self, name: &str) -> Result<RecoveryPhraseUse> {
+        let account = self.account(name)?;
+        let AccountKind::Derived { master, .. } = account.kind else {
+            return Ok(RecoveryPhraseUse::ImportedKey);
+        };
+        let entropy = &self.masters[usize::from(master)].entropy;
+        // The same phrase may have been imported into more than one master entry.
+        let shared = self.accounts.iter().any(|other| {
+            other.name != name
+                && matches!(other.kind, AccountKind::Derived { master, .. }
+                if self.masters[usize::from(master)].entropy == *entropy)
+        });
+        Ok(if shared {
+            RecoveryPhraseUse::Shared
+        } else {
+            RecoveryPhraseUse::UnusedAfterDeletion
+        })
+    }
+
+    pub fn remove_account(&mut self, name: &str, erase_phrase: bool) -> Result<()> {
+        let usage = self.recovery_phrase_use(name)?;
+        if erase_phrase && usage != RecoveryPhraseUse::UnusedAfterDeletion {
+            return fail("recovery phrase is still used or this wallet has no recovery phrase");
+        }
+        let index = self
+            .accounts
+            .iter()
+            .position(|a| a.name == name)
+            .ok_or("unknown wallet")?;
+        let mut erase = [false; MAX_MASTERS];
+        if erase_phrase && let AccountKind::Derived { master, .. } = self.accounts[index].kind {
+            for (i, candidate) in self.masters.iter().enumerate() {
+                erase[i] = candidate.entropy == self.masters[usize::from(master)].entropy;
+            }
+        }
+        if let AccountKind::Imported { keypair } = &mut self.accounts[index].kind {
+            // Wipe in place before Vec::remove moves the value out of its old slot.
+            keypair.zeroize();
+        }
+        self.accounts.remove(index);
+        // Remove all unused copies of that phrase, preserving remaining master references.
+        for index in (0..self.masters.len()).rev() {
+            if erase[index] {
+                self.masters.remove(index);
+                for account in &mut self.accounts {
+                    if let AccountKind::Derived { master, .. } = &mut account.kind
+                        && usize::from(*master) > index
+                    {
+                        *master -= 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn is_known_recipient(&self, pubkey: &Pubkey) -> bool {
         self.recipients.iter().any(|key| key == pubkey.as_ref())
     }
@@ -274,7 +404,10 @@ impl Vault {
         let mnemonic = Mnemonic::from_entropy(&entropy)?;
         let master = self.masters.len() as u8;
         let pubkey = derive_signer(&mnemonic, 0)?.pubkey();
-        self.masters.push(Master { entropy });
+        self.masters.push(Master {
+            entropy,
+            next_index: 1,
+        });
         self.accounts.push(Account {
             name: name.into(),
             pubkey,
@@ -288,17 +421,7 @@ impl Vault {
         if self.masters.is_empty() {
             return fail("no master wallet exists");
         }
-        let next = self
-            .accounts
-            .iter()
-            .filter_map(|a| match a.kind {
-                AccountKind::Derived { master: 0, index } => Some(index),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("derivation index exhausted")?;
+        let next = self.masters[0].next_index;
         let mnemonic = Mnemonic::from_entropy(&self.masters[0].entropy)?;
         let pubkey = derive_signer(&mnemonic, next)?.pubkey();
         self.accounts.push(Account {
@@ -309,6 +432,7 @@ impl Vault {
                 index: next,
             },
         });
+        self.masters[0].next_index = next + 1;
         Ok(())
     }
 
@@ -336,6 +460,28 @@ impl Vault {
         Ok(())
     }
 
+    pub fn derivation_index(&self, name: &str) -> Result<Option<u32>> {
+        match &self.account(name)?.kind {
+            AccountKind::Derived { index, .. } => Ok(Some(*index)),
+            AccountKind::Imported { .. } => Ok(None),
+        }
+    }
+
+    pub fn mnemonic(&self, name: &str) -> Result<Zeroizing<String>> {
+        match &self.account(name)?.kind {
+            AccountKind::Derived { master, .. } => {
+                let master = self
+                    .masters
+                    .get(usize::from(*master))
+                    .ok_or("invalid master reference")?;
+                phrase(&master.entropy)
+            }
+            AccountKind::Imported { .. } => {
+                fail("imported private-key wallets have no stored recovery phrase")
+            }
+        }
+    }
+
     pub fn signer(&self, name: &str) -> Result<Keypair> {
         let account = self.account(name)?;
         let keypair = match &account.kind {
@@ -361,11 +507,35 @@ impl Vault {
         {
             return fail("vault limits exceeded");
         }
-        let mut out = Zeroizing::new(Vec::with_capacity(256 + self.accounts.len() * 120));
+        let size = 1
+            + self
+                .masters
+                .iter()
+                .map(|m| 1 + m.entropy.len() + 4)
+                .sum::<usize>()
+            + 2
+            + self
+                .accounts
+                .iter()
+                .map(|a| {
+                    1 + a.name.len()
+                        + 32
+                        + 1
+                        + match a.kind {
+                            AccountKind::Derived { .. } => 5,
+                            AccountKind::Imported { .. } => 64,
+                        }
+                })
+                .sum::<usize>()
+            + 2
+            + self.recipients.len() * 32;
+        // Reserve the AEAD tag too: growing a plaintext Vec can leave unwiped copies.
+        let mut out = Zeroizing::new(Vec::with_capacity(size + 16));
         out.push(self.masters.len() as u8);
         for master in &self.masters {
             out.push(master.entropy.len() as u8);
             out.extend_from_slice(&master.entropy);
+            out.extend_from_slice(&master.next_index.to_le_bytes());
         }
         out.extend_from_slice(&(self.accounts.len() as u16).to_le_bytes());
         for account in &self.accounts {
@@ -391,7 +561,10 @@ impl Vault {
         Ok(out)
     }
 
-    fn decode(data: &[u8]) -> Result<Self> {
+    fn decode(data: &[u8], version: u8) -> Result<Self> {
+        if !matches!(version, 1 | VERSION) {
+            return fail("unsupported vault version");
+        }
         let mut reader = Reader { data, pos: 0 };
         let master_count = reader.u8()? as usize;
         if master_count > MAX_MASTERS {
@@ -405,7 +578,18 @@ impl Vault {
             }
             let entropy = Zeroizing::new(reader.take(len)?.to_vec());
             Mnemonic::from_entropy(&entropy)?;
-            masters.push(Master { entropy });
+            let next_index = if version == 1 {
+                1
+            } else {
+                u32::from_le_bytes(reader.take(4)?.try_into()?)
+            };
+            if next_index == 0 || next_index > (1 << 31) {
+                return fail("invalid next derivation index");
+            }
+            masters.push(Master {
+                entropy,
+                next_index,
+            });
         }
         let count = reader.u16()? as usize;
         if count > MAX_ACCOUNTS {
@@ -423,8 +607,14 @@ impl Vault {
                 0 => {
                     let master = reader.u8()?;
                     let index = u32::from_le_bytes(reader.take(4)?.try_into()?);
-                    if usize::from(master) >= masters.len() {
+                    if usize::from(master) >= masters.len() || index >= (1 << 31) {
                         return fail("invalid master reference");
+                    }
+                    let next = &mut masters[usize::from(master)].next_index;
+                    if version == 1 {
+                        *next = (*next).max(index + 1);
+                    } else if index >= *next {
+                        return fail("derivation counter would reuse an existing index");
                     }
                     AccountKind::Derived { master, index }
                 }
@@ -454,6 +644,7 @@ impl Vault {
             masters,
             accounts,
             recipients,
+            source_bytes: None,
         })
     }
 }
@@ -484,7 +675,17 @@ pub fn fresh_entropy() -> Result<Zeroizing<Vec<u8>>> {
 }
 
 pub fn phrase(entropy: &[u8]) -> Result<Zeroizing<String>> {
-    Ok(Zeroizing::new(Mnemonic::from_entropy(entropy)?.to_string()))
+    let mnemonic = Mnemonic::from_entropy(entropy)?;
+    let words = mnemonic.words();
+    let len = words.clone().map(str::len).sum::<usize>() + words.clone().count() - 1;
+    let mut text = Zeroizing::new(String::with_capacity(len));
+    for word in words {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(word);
+    }
+    Ok(text)
 }
 
 fn derive_signer(mnemonic: &Mnemonic, index: u32) -> Result<Keypair> {
@@ -504,6 +705,352 @@ fn derive_signer(mnemonic: &Mnemonic, index: u32) -> Result<Keypair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let mut random = [0u8; 8];
+            getrandom::getrandom(&mut random).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "solx-vault-test-{:016x}",
+                u64::from_le_bytes(random)
+            ));
+            create_private_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("vault.enc")
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn phrase_uses_one_exact_capacity_buffer() {
+        for len in [16, 20, 24, 28, 32] {
+            let entropy = vec![42; len];
+            let text = phrase(&entropy).unwrap();
+            assert_eq!(
+                text.as_str(),
+                Mnemonic::from_entropy(&entropy).unwrap().to_string()
+            );
+            assert_eq!(text.capacity(), text.len());
+        }
+    }
+
+    #[test]
+    fn exported_secrets_match_each_master_without_changing_the_vault() {
+        let dir = TestDir::new();
+        let session = Session::test_session(&dir.path());
+        let mut data = Vault::default();
+        data.add_master("main", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        data.masters[0].next_index = 7;
+        data.add_derived("child").unwrap();
+        data.add_master("independent", Zeroizing::new(vec![1; 16]))
+            .unwrap();
+        data.add_imported(
+            "imported",
+            Keypair::new_from_array([7; 32]).to_keypair_bytes(),
+        )
+        .unwrap();
+        session.save(&mut data).unwrap();
+        let before = fs::read(dir.path()).unwrap();
+        let plain_before = data.encode().unwrap();
+        for (name, index, entropy) in [
+            ("main", 0, vec![0; 32]),
+            ("child", 7, vec![0; 32]),
+            ("independent", 0, vec![1; 16]),
+        ] {
+            let text = data.mnemonic(name).unwrap();
+            assert_eq!(text.as_str(), phrase(&entropy).unwrap().as_str());
+            assert_eq!(data.derivation_index(name).unwrap(), Some(index));
+            let mnemonic = Mnemonic::parse(text.as_str()).unwrap();
+            let restored = derive_signer(&mnemonic, index).unwrap();
+            assert_eq!(restored.pubkey(), data.account(name).unwrap().pubkey);
+            assert_eq!(
+                *restored.to_keypair_bytes(),
+                *data.signer(name).unwrap().to_keypair_bytes()
+            );
+        }
+        assert_eq!(data.derivation_index("imported").unwrap(), None);
+        assert!(data.mnemonic("imported").is_err());
+        assert!(data.mnemonic("unknown").is_err());
+        assert!(data.derivation_index("unknown").is_err());
+        assert_eq!(data.encode().unwrap().as_slice(), plain_before.as_slice());
+        assert_eq!(fs::read(dir.path()).unwrap(), before);
+        let reopened = session.load().unwrap();
+        assert_eq!(reopened.masters[0].next_index, 8);
+        assert_eq!(
+            reopened.account("child").unwrap().pubkey,
+            data.account("child").unwrap().pubkey
+        );
+    }
+
+    #[test]
+    fn stale_saves_and_competing_creates_cannot_overwrite() {
+        let dir = TestDir::new();
+        let session = Session::test_session(&dir.path());
+        let mut first = Vault::default();
+        first
+            .add_master("main", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        session.save(&mut first).unwrap();
+        let mut stale = session.load().unwrap();
+        first.add_derived("second").unwrap();
+        session.save(&mut first).unwrap();
+        stale.add_derived("lost").unwrap();
+        assert!(
+            session
+                .save(&mut stale)
+                .unwrap_err()
+                .to_string()
+                .contains("vault changed")
+        );
+        assert!(session.save(&mut Vault::default()).is_err());
+        let saved = session.load().unwrap();
+        assert!(saved.contains("second"));
+        assert!(!saved.contains("lost"));
+        first.add_derived("third").unwrap();
+        session.save(&mut first).unwrap();
+        assert!(session.load().unwrap().contains("third"));
+    }
+
+    #[test]
+    fn commit_lock_is_nonblocking_and_reusable() {
+        let dir = TestDir::new();
+        let first = lock_vault(&dir.path()).unwrap();
+        assert!(
+            lock_vault(&dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("busy")
+        );
+        drop(first);
+        assert!(lock_vault(&dir.path()).is_ok());
+    }
+
+    #[test]
+    fn deletion_never_erases_a_shared_phrase_and_remaps_remaining_masters() {
+        let mut vault = Vault::default();
+        vault
+            .add_master("main", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        vault
+            .add_master("independent", Zeroizing::new(vec![1; 32]))
+            .unwrap();
+        vault
+            .add_master("same_phrase", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        let independent = vault.signer("independent").unwrap().pubkey();
+        assert_eq!(
+            vault.recovery_phrase_use("main").unwrap(),
+            RecoveryPhraseUse::Shared
+        );
+        assert!(vault.remove_account("main", true).is_err());
+        assert_eq!(vault.accounts.len(), 3);
+        vault.remove_account("same_phrase", false).unwrap();
+        assert_eq!(
+            vault.recovery_phrase_use("main").unwrap(),
+            RecoveryPhraseUse::UnusedAfterDeletion
+        );
+        vault.remove_account("main", true).unwrap();
+        assert_eq!(vault.masters.len(), 1); // Both unused copies of the erased phrase are gone.
+        assert_eq!(vault.signer("independent").unwrap().pubkey(), independent);
+        let mut reopened = Vault::decode(&vault.encode().unwrap(), VERSION).unwrap();
+        reopened.add_derived("next").unwrap();
+        assert_eq!(
+            reopened.signer("independent").unwrap().pubkey(),
+            independent
+        );
+        assert_ne!(reopened.signer("next").unwrap().pubkey(), independent);
+    }
+
+    #[test]
+    fn deleting_highest_index_does_not_recycle_addresses_after_reopen() {
+        let dir = TestDir::new();
+        let session = Session::test_session(&dir.path());
+        let mut vault = Vault::default();
+        vault
+            .add_master("main", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        vault.add_derived("last").unwrap();
+        let removed = vault.signer("last").unwrap().pubkey();
+        session.save(&mut vault).unwrap();
+        vault.remove_account("last", false).unwrap();
+        session.save(&mut vault).unwrap();
+        let mut vault = session.load().unwrap();
+        assert!(!vault.contains("last"));
+        vault.add_derived("new").unwrap();
+        let new = vault.signer("new").unwrap().pubkey();
+        assert_ne!(new, removed);
+        assert!(matches!(
+            vault.account("new").unwrap().kind,
+            AccountKind::Derived { index: 2, .. }
+        ));
+        vault.remove_account("main", false).unwrap();
+        assert_eq!(vault.signer("new").unwrap().pubkey(), new);
+        vault.remove_account("new", false).unwrap();
+        session.save(&mut vault).unwrap();
+        let mut vault = session.load().unwrap();
+        assert!(vault.accounts.is_empty());
+        assert!(vault.first_name().is_err());
+        vault.add_derived("after_empty").unwrap();
+        assert!(matches!(
+            vault.account("after_empty").unwrap().kind,
+            AccountKind::Derived { index: 3, .. }
+        ));
+        vault.remove_account("after_empty", true).unwrap();
+        session.save(&mut vault).unwrap();
+        let mut vault = session.load().unwrap();
+        assert!(vault.masters.is_empty());
+        assert!(vault.add_derived("no_master").is_err());
+        vault
+            .add_master("fresh", Zeroizing::new(vec![1; 32]))
+            .unwrap();
+    }
+
+    #[test]
+    fn erase_decision_cannot_overwrite_a_new_reference() {
+        let dir = TestDir::new();
+        let session = Session::test_session(&dir.path());
+        let mut vault = Vault::default();
+        vault
+            .add_master("main", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        session.save(&mut vault).unwrap();
+        let mut stale = session.load().unwrap();
+        assert_eq!(
+            stale.recovery_phrase_use("main").unwrap(),
+            RecoveryPhraseUse::UnusedAfterDeletion
+        );
+        vault.add_derived("child").unwrap();
+        session.save(&mut vault).unwrap();
+        stale.remove_account("main", true).unwrap();
+        assert!(session.save(&mut stale).is_err());
+        let current = session.load().unwrap();
+        assert!(current.contains("main"));
+        assert!(current.signer("child").is_ok());
+    }
+
+    #[test]
+    fn imported_key_deletion_and_unknown_name_are_handled() {
+        let mut vault = Vault::default();
+        let bytes = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).to_keypair_bytes();
+        vault
+            .add_imported("imported", Zeroizing::new(bytes))
+            .unwrap();
+        assert_eq!(
+            vault.recovery_phrase_use("imported").unwrap(),
+            RecoveryPhraseUse::ImportedKey
+        );
+        assert!(vault.remove_account("missing", false).is_err());
+        assert!(vault.remove_account("imported", true).is_err());
+        assert!(vault.contains("imported"));
+        vault.remove_account("imported", false).unwrap();
+        let decoded = Vault::decode(&vault.encode().unwrap(), VERSION).unwrap();
+        assert!(decoded.accounts.is_empty());
+        assert!(decoded.signer("imported").is_err());
+    }
+
+    #[test]
+    fn version_one_vault_migrates_without_changing_addresses() {
+        let dir = TestDir::new();
+        let session = Session::test_session(&dir.path());
+        let mnemonic = Mnemonic::from_entropy(&[0; 32]).unwrap();
+        let address = derive_signer(&mnemonic, 7).unwrap().pubkey();
+        // Original v1 layout: one master, one derived account at index 7, no recipients.
+        let mut payload = Zeroizing::new(vec![1, 32]);
+        payload.extend_from_slice(&[0; 32]);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(6);
+        payload.extend_from_slice(b"legacy");
+        payload.extend_from_slice(address.as_ref());
+        payload.extend_from_slice(&[0, 0]);
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        let mut header = [0; HEADER_LEN];
+        header[..4].copy_from_slice(MAGIC);
+        header[4] = 1;
+        header[5..21].copy_from_slice(&session.salt);
+        header[21..].copy_from_slice(&[3; 12]);
+        Aes256GcmSiv::new_from_slice(&session.key.key[..])
+            .unwrap()
+            .encrypt_in_place(Nonce::from_slice(&[3; 12]), &header, &mut *payload)
+            .unwrap();
+        let mut file = private_file(&dir.path()).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&payload).unwrap();
+        drop(file);
+        let mut vault = session.load().unwrap();
+        assert_eq!(vault.signer("legacy").unwrap().pubkey(), address);
+        assert_eq!(vault.masters[0].next_index, 8);
+        assert_eq!(fs::read(dir.path()).unwrap()[4], 1); // Reading alone does not migrate.
+        session.save(&mut vault).unwrap();
+        assert_eq!(fs::read(dir.path()).unwrap()[4], VERSION);
+        let mut vault = session.load().unwrap();
+        assert_eq!(vault.signer("legacy").unwrap().pubkey(), address);
+        vault.add_derived("next").unwrap();
+        assert_eq!(
+            vault.signer("next").unwrap().pubkey(),
+            derive_signer(&mnemonic, 8).unwrap().pubkey()
+        );
+        let bytes = vault.encode().unwrap();
+        assert!(Vault::decode(&bytes, 99).is_err());
+        assert!(Vault::decode(&bytes[..bytes.len() - 1], VERSION).is_err());
+    }
+
+    #[test]
+    fn derivation_counters_reject_reuse_and_do_not_wrap() {
+        let mut vault = Vault::default();
+        vault
+            .add_master("main", Zeroizing::new(vec![0; 32]))
+            .unwrap();
+        vault.add_derived("child").unwrap();
+        let bytes = vault.encode().unwrap();
+        for invalid in [0u32, 1, (1 << 31) + 1] {
+            let mut malformed = bytes.clone();
+            malformed[34..38].copy_from_slice(&invalid.to_le_bytes());
+            assert!(Vault::decode(&malformed, VERSION).is_err());
+        }
+        vault.masters[0].next_index = 1 << 31;
+        let mut reopened = Vault::decode(&vault.encode().unwrap(), VERSION).unwrap();
+        assert!(reopened.add_derived("exhausted").is_err());
+        assert_eq!(reopened.accounts.len(), 2);
+        assert_eq!(reopened.masters[0].next_index, 1 << 31);
+    }
+
+    #[test]
+    fn plaintext_has_capacity_for_largest_vault_and_authentication_tag() {
+        fn requires_wiping<T: zeroize::ZeroizeOnDrop>() {}
+        requires_wiping::<Mnemonic>();
+        let mut vault = Vault::default();
+        for _ in 0..MAX_MASTERS {
+            vault.masters.push(Master {
+                entropy: Zeroizing::new(vec![0; 32]),
+                next_index: 1,
+            });
+        }
+        let bytes = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).to_keypair_bytes();
+        for i in 0..MAX_ACCOUNTS {
+            vault
+                .add_imported(&format!("{i:032}"), Zeroizing::new(bytes))
+                .unwrap();
+        }
+        vault.recipients = vec![[3; 32]; MAX_RECIPIENTS];
+        let mut plain = vault.encode().unwrap();
+        assert!(plain.capacity() >= plain.len() + 16);
+        let pointer = plain.as_ptr();
+        Aes256GcmSiv::new_from_slice(&[4; 32])
+            .unwrap()
+            .encrypt_in_place(Nonce::from_slice(&[5; 12]), b"test", &mut *plain)
+            .unwrap();
+        assert_eq!(plain.as_ptr(), pointer);
+    }
+
     #[test]
     fn deterministic_derivation_and_vault_round_trip() {
         let mut vault = Vault::default();
@@ -516,7 +1063,7 @@ mod tests {
             vault.account("second").unwrap().pubkey
         );
         let bytes = vault.encode().unwrap();
-        let decoded = Vault::decode(&bytes).unwrap();
+        let decoded = Vault::decode(&bytes, VERSION).unwrap();
         assert_eq!(
             decoded.signer("main").unwrap().pubkey(),
             vault.account("main").unwrap().pubkey
@@ -539,7 +1086,7 @@ mod tests {
         vault
             .add_master("main", Zeroizing::new(vec![0u8; 32]))
             .unwrap();
-        let session = Session::create(&path, "correct horse battery staple", &vault).unwrap();
+        let session = Session::create(&path, "correct horse battery staple", &mut vault).unwrap();
         assert_eq!(session.load().unwrap().accounts.len(), 1);
         assert!(Session::open(&path, "wrong").is_err());
         let mut bytes = fs::read(&path).unwrap();

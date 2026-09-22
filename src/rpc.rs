@@ -34,7 +34,10 @@ impl Rpc {
             .host_str()
             .ok_or("RPC URL has no host")?
             .to_owned();
-        let client = Client::builder().timeout(config.rpc_timeout()).build()?;
+        let client = Client::builder()
+            .timeout(config.rpc_timeout())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(Self {
             client,
             url: url.clone(),
@@ -45,12 +48,10 @@ impl Rpc {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let request = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
-        let mut response = self
-            .client
-            .post(&self.url)
-            .json(&request)
-            .send()?
-            .error_for_status()?;
+        let mut response = self.client.post(&self.url).json(&request).send()?;
+        if !response.status().is_success() {
+            return Err(format!("RPC {method}: HTTP {}", response.status()).into());
+        }
         let mut body = Vec::new();
         response
             .by_ref()
@@ -288,6 +289,42 @@ pub fn safe_text(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_rejects_redirects_without_contacting_the_target() {
+        use std::{io::Write, net::TcpListener};
+        for status in [301, 302, 307, 308, 500] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut config = Config::default();
+            config.rpc.url = Some(format!("http://{}", listener.local_addr().unwrap()));
+            config.rpc.timeout_secs = 2;
+            let location = format!("http://{}", target.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0; 4096];
+                assert!(stream.read(&mut buffer).unwrap() > 0);
+                write!(stream, "HTTP/1.1 {status} Test\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let error = Rpc::new(&config)
+                .unwrap()
+                .call("test", json!([]))
+                .unwrap_err();
+            server.join().unwrap();
+            assert!(
+                error.to_string().contains(&format!("HTTP {status}")),
+                "{error}"
+            );
+            target.set_nonblocking(true).unwrap();
+            assert_eq!(
+                target.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 
     #[test]
     fn parsed_token_balance_uses_raw_amount_and_checks_program() {

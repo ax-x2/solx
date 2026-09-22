@@ -2,7 +2,7 @@
 name = "solx"
 description = "solana local encrypted wallet"
 license = "MIT"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 repository = "https://github.com/ax-x2/solx"
@@ -11,7 +11,7 @@ homepage = "https://1000x.sh"
 [dependencies]
 aes-gcm-siv = "0.11.1"
 base64 = "0.22.1"
-bip39 = "2.2.2"
+bip39 = { version = "2.2.2", features = ["zeroize"] }
 bs58 = "0.5.1"
 ed25519-dalek-bip32 = "0.3.0"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }

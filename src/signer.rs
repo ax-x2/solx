@@ -16,6 +16,10 @@ impl Keypair {
         Pubkey::from(self.0.verifying_key().to_bytes())
     }
 
+    pub fn to_keypair_bytes(&self) -> Zeroizing<[u8; 64]> {
+        Zeroizing::new(self.0.to_keypair_bytes())
+    }
+
     pub fn sign_message(&self, message: &[u8]) -> Signature {
         Signature::from(self.0.sign(message).to_bytes())
     }
