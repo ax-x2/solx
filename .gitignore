@@ -1,5 +1,5 @@
 /target
-/.sol/
+/.solx/
 /config.toml
 /*.enc
-Cargo.lock
+/.github

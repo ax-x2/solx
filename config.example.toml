@@ -1,11 +1,13 @@
-# ~/.solx/config.toml - do not put passwords or private keys here
-vault = "~/.solx/vault.enc"
+# Reference only: use `solx config` to edit settings interactively.
+# Settings are stored in the encrypted vault; this file cannot be imported.
 mode = "cli"
 
 [rpc]
 url = "https://api.mainnet-beta.solana.com"
 cluster = "mainnet"
 timeout_secs = 15
+# When false, list / list NAME show only local names and addresses, without RPC.
+show_balances = false
 
 [security]
 confirm_every_transaction = true
@@ -14,7 +16,7 @@ simulate_before_send = true
 show_simulation = true
 optimize_compute_units = true
 compute_unit_margin_percent = 10
-cache_unlocked_in_shell = true
+cache_unlocked_in_shell = false
 
 [history]
 fetch_on_start = false
@@ -23,4 +25,4 @@ wallets = []
 limit = 10
 
 [aliases]
-# x1 = ["list", "--wallet", "main"]
+# x1 = ["list", "main"]

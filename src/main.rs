@@ -1,8 +1,19 @@
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("solx supports Linux and macOS only");
+
 mod commands;
 mod config;
+mod kdf;
 mod line_editor;
 mod rpc;
+mod secret;
+mod secure_file;
+mod settings;
 mod signer;
+#[cfg(test)]
+mod test_alloc;
+#[cfg(test)]
+mod test_support;
 mod vault;
 
 use crate::{
@@ -25,7 +36,6 @@ fn fail<T>(message: &str) -> Result<T> {
 
 pub struct App {
     config: Config,
-    config_path: PathBuf,
     session: Option<Session>,
     shell: bool,
     last_history: Option<Instant>,
@@ -34,7 +44,8 @@ pub struct App {
 impl App {
     fn unlock(&mut self) -> Result<&Session> {
         if self.session.is_none() {
-            let password = Zeroizing::new(rpassword::prompt_password("Vault password: ")?);
+            kdf::prepare_memlock_allowance()?;
+            let password = secret::prompt("Vault password: ", 1024)?;
             self.session = Some(Session::open(&self.config.vault, &password)?);
         }
         Ok(self.session.as_ref().expect("session just opened"))
@@ -42,6 +53,28 @@ impl App {
 
     fn vault(&mut self) -> Result<Vault> {
         self.unlock()?.load()
+    }
+    fn release_session(&mut self) {
+        if !self.shell || !self.config.security.cache_unlocked_in_shell {
+            self.session = None;
+        }
+    }
+    fn public_vault(&mut self) -> Result<vault::PublicVault> {
+        let result = self.vault().map(|vault| vault.public_snapshot());
+        self.release_session();
+        result
+    }
+    fn load_policy(&mut self) -> Result<()> {
+        let path = self.config.vault.clone();
+        let mut vault = self.vault()?;
+        self.config = std::mem::take(&mut vault.config);
+        self.config.vault = path;
+        drop(vault);
+        self.release_session();
+        if self.config.security.cache_unlocked_in_shell {
+            eprintln!("Session caching is enabled: use 'lock' to clear the unlocking key.");
+        }
+        Ok(())
     }
     fn save_vault(&mut self, vault: &mut Vault) -> Result<()> {
         self.unlock()?.save(vault)
@@ -69,7 +102,9 @@ impl App {
         result
     }
     fn rpc(&self) -> Result<rpc::Rpc> {
-        rpc::Rpc::new(&self.config)
+        let rpc = rpc::Rpc::new(&self.config)?;
+        rpc.verify_cluster()?;
+        Ok(rpc)
     }
 
     fn dispatch(&mut self, words: &[String]) -> Result<()> {
@@ -113,7 +148,7 @@ impl App {
         let wallets = history.wallets.clone();
         let limit = history.limit;
         self.last_history = Some(Instant::now());
-        let vault = self.vault()?;
+        let vault = self.public_vault()?;
         let mut rpc = None;
         for name in wallets {
             if !vault.contains(&name) {
@@ -223,22 +258,30 @@ fn read_bounded_line() -> io::Result<Option<String>> {
 
 fn run() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let mut config_path = config::default_path();
+    let mut config = Config::default();
     if args.first().is_some_and(|a| a == "--config") {
+        return fail("external config is not supported; use solx config to edit vault settings");
+    }
+    if args.first().is_some_and(|a| a == "--vault") {
         if args.len() < 2 {
-            return fail("--config needs a path");
+            return fail("--vault needs a path");
         }
-        config_path = PathBuf::from(args.remove(1));
+        config.vault = PathBuf::from(args.remove(1));
         args.remove(0);
     }
-    let config = config::load(&config_path)?;
+    let shell = args.is_empty() || args[0] == "shell";
     let mut app = App {
         config,
-        config_path,
         session: None,
-        shell: false,
+        shell,
         last_history: None,
     };
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("init" | "help" | "config")
+    ) {
+        app.load_policy()?;
+    }
     if args.is_empty() {
         return match app.config.mode {
             Mode::Cli => app.shell(),
@@ -252,7 +295,7 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = secret::protect_process().and_then(|()| run()) {
         eprintln!("Error: {error}");
         std::process::exit(1);
     }
@@ -262,6 +305,32 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_snapshots_release_non_cached_secrets() {
+        let mut wallet = crate::test_support::TestWallet::new();
+        let snapshot = wallet.app.public_vault().unwrap();
+        assert!(wallet.app.session.is_none());
+        assert_eq!(
+            snapshot.account("test").unwrap().pubkey,
+            wallet.identity.pubkey
+        );
+    }
+
+    #[test]
+    fn policy_is_loaded_only_from_authenticated_vault() {
+        let mut wallet = crate::test_support::TestWallet::new();
+        let session = wallet.app.session.as_ref().unwrap();
+        let mut vault = session.load().unwrap();
+        let mut config = Config::default();
+        config.aliases.insert("trusted".into(), vec!["list".into()]);
+        vault.config = config;
+        session.save(&mut vault).unwrap();
+        wallet.app.load_policy().unwrap();
+        assert_eq!(wallet.app.config.aliases["trusted"], ["list"]);
+        assert!(wallet.app.session.is_none());
+        assert!(wallet.app.config.vault.ends_with("vault.enc"));
+    }
+
     fn app(cached: bool) -> App {
         let mut config = Config::default();
         config.security.cache_unlocked_in_shell = cached;
@@ -269,7 +338,6 @@ mod tests {
         config.vault = PathBuf::new();
         App {
             config,
-            config_path: PathBuf::new(),
             session: Some(Session::test_session(std::path::Path::new(""))),
             shell: true,
             last_history: None,

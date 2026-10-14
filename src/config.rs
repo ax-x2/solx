@@ -1,16 +1,11 @@
 use crate::{Result, fail};
-use serde::Deserialize;
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
     pub vault: PathBuf,
     pub mode: Mode,
     pub rpc: RpcConfig,
@@ -19,7 +14,7 @@ pub struct Config {
     pub aliases: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
@@ -27,15 +22,17 @@ pub enum Mode {
     Ui,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RpcConfig {
     pub url: Option<String>,
     pub cluster: String,
+    pub expected_genesis_hash: Option<String>,
     pub timeout_secs: u64,
+    pub show_balances: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     pub confirm_every_transaction: bool,
@@ -47,7 +44,7 @@ pub struct SecurityConfig {
     pub cache_unlocked_in_shell: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HistoryConfig {
     pub fetch_on_start: bool,
@@ -72,8 +69,10 @@ impl Default for RpcConfig {
     fn default() -> Self {
         Self {
             url: None,
-            cluster: "devnet".into(),
+            cluster: "mainnet".into(),
+            expected_genesis_hash: None,
             timeout_secs: 15,
+            show_balances: false,
         }
     }
 }
@@ -86,7 +85,7 @@ impl Default for SecurityConfig {
             show_simulation: true,
             optimize_compute_units: true,
             compute_unit_margin_percent: 10,
-            cache_unlocked_in_shell: true,
+            cache_unlocked_in_shell: false,
         }
     }
 }
@@ -108,47 +107,31 @@ pub fn default_dir() -> PathBuf {
         .join(".solx")
 }
 
-pub fn default_path() -> PathBuf {
-    default_dir().join("config.toml")
-}
-
-pub fn load(path: &Path) -> Result<Config> {
-    let mut config = if path.exists() {
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if metadata.len() > 64 * 1024 {
-            return fail("config is too large");
-        }
-        let mut content = String::with_capacity(metadata.len() as usize);
-        file.take(64 * 1024 + 1).read_to_string(&mut content)?;
-        if content.len() > 64 * 1024 {
-            return fail("config is too large");
-        }
-        toml::from_str::<Config>(&content)?
-    } else {
-        Config::default()
-    };
-    config.vault = expand_home(&config.vault);
-    config.validate()?;
-    Ok(config)
-}
-
-fn expand_home(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if text == "~" {
-        default_dir()
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf()
-    } else if let Some(rest) = text.strip_prefix("~/") {
-        default_dir().parent().unwrap_or(Path::new(".")).join(rest)
-    } else {
-        path.to_path_buf()
-    }
-}
-
 impl Config {
-    fn validate(&self) -> Result<()> {
+    /// Compare persisted settings, excluding the launch-only vault locator.
+    pub fn same_settings(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.rpc == other.rpc
+            && self.security == other.security
+            && self.history == other.history
+            && self.aliases == other.aliases
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        crate::rpc::expected_genesis(self)?;
+        match self.rpc.cluster.as_str() {
+            "mainnet" | "devnet" | "testnet" => {}
+            "custom" if self.rpc.expected_genesis_hash.is_some() => {}
+            _ => {
+                return fail(
+                    "cluster must be mainnet, devnet, testnet, or custom with expected_genesis_hash",
+                );
+            }
+        }
+        if let Some(hash) = &self.rpc.expected_genesis_hash {
+            use std::str::FromStr;
+            solana_message::Hash::from_str(hash)?;
+        }
         if !(1..=120).contains(&self.rpc.timeout_secs) {
             return fail("rpc.timeout_secs must be 1..=120");
         }
@@ -171,6 +154,10 @@ impl Config {
         }
         for (name, words) in &self.aliases {
             if !valid_name(name)
+                || matches!(name.as_str(), "shell" | "exit" | "quit")
+                || crate::commands::PLUGINS
+                    .iter()
+                    .any(|command| command.name == name)
                 || words.is_empty()
                 || words.len() > 16
                 || words.iter().any(|word| word.len() > 256)
@@ -220,11 +207,73 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+#[cfg(test)]
 pub const EXAMPLE: &str = include_str!("../config.example.toml");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn balance_queries_default_off_and_changes_are_persisted_settings() {
+        let mut config = Config::default();
+        assert!(!config.rpc.show_balances);
+        assert!(
+            !serde_json::from_str::<Config>("{\"rpc\":{}}")
+                .unwrap()
+                .rpc
+                .show_balances
+        );
+        let original = config.clone();
+        config.rpc.show_balances = true;
+        assert!(!config.same_settings(&original));
+        let stored = serde_json::to_vec(&config).unwrap();
+        assert!(
+            serde_json::from_slice::<Config>(&stored)
+                .unwrap()
+                .rpc
+                .show_balances
+        );
+    }
+
+    #[test]
+    fn aliases_cannot_shadow_commands_and_caching_defaults_off() {
+        let mut config = Config::default();
+        assert!(!config.security.cache_unlocked_in_shell);
+        for name in crate::commands::PLUGINS
+            .iter()
+            .map(|p| p.name)
+            .chain(["shell", "exit", "quit"])
+        {
+            config.aliases.clear();
+            config.aliases.insert(name.into(), vec!["transfer".into()]);
+            assert!(config.validate().is_err(), "{name}");
+        }
+    }
+    #[test]
+    fn stored_locator_is_rejected() {
+        assert!(
+            toml::from_str::<Config>("vault = '/attacker/vault.enc'")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+        assert!(
+            !toml::to_string(&Config::default())
+                .unwrap()
+                .contains("vault")
+        );
+    }
+    #[test]
+    fn custom_networks_require_a_pin_and_known_pins_cannot_be_overridden() {
+        let mut config = Config::default();
+        config.rpc.cluster = "custom".into();
+        assert!(config.validate().is_err());
+        config.rpc.expected_genesis_hash =
+            Some(solana_message::Hash::new_from_array([7; 32]).to_string());
+        config.validate().unwrap();
+        config.rpc.cluster = "mainnet".into();
+        assert!(config.validate().is_err());
+    }
     #[test]
     fn config_example_parses() {
         let config: Config = toml::from_str(EXAMPLE).unwrap();
@@ -234,13 +283,12 @@ mod tests {
     #[test]
     fn alias_expands_once() {
         let mut config = Config::default();
-        config.aliases.insert(
-            "x1".into(),
-            vec!["list".into(), "--wallet".into(), "main".into()],
-        );
+        config
+            .aliases
+            .insert("x1".into(), vec!["list".into(), "main".into()]);
         assert_eq!(
             config.expand_alias(&["x1".into()]).unwrap(),
-            ["list", "--wallet", "main"]
+            ["list", "main"]
         );
     }
 }

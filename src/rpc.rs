@@ -4,7 +4,12 @@ use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use solana_message::{Hash, VersionedMessage};
 use solana_pubkey::Pubkey;
-use std::{io::Read, str::FromStr, thread, time::Duration};
+use std::{
+    io::Read,
+    str::FromStr,
+    thread,
+    time::{Duration, Instant},
+};
 
 const MAX_BODY: u64 = 2 * 1024 * 1024;
 
@@ -13,6 +18,48 @@ pub struct Rpc {
     url: String,
     pub cluster: String,
     pub endpoint: String,
+    timeout: Duration,
+    expected_genesis: String,
+}
+
+pub struct BlockhashContext {
+    pub hash: Hash,
+    pub last_valid_block_height: u64,
+    pub context_slot: u64,
+}
+
+pub enum SubmissionOutcome {
+    Confirmed(solana_transaction::Signature),
+    Unknown {
+        signature: solana_transaction::Signature,
+        reason: String,
+    },
+}
+
+pub fn expected_genesis(config: &Config) -> Result<&str> {
+    // Pinned network identities from Solana SDK genesis_config.rs.
+    let known = match config.rpc.cluster.as_str() {
+        "mainnet" => "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+        "devnet" => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+        "testnet" => "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY",
+        "custom" => {
+            return config
+                .rpc
+                .expected_genesis_hash
+                .as_deref()
+                .ok_or_else(|| "custom cluster requires expected_genesis_hash".into());
+        }
+        _ => return fail("unknown cluster"),
+    };
+    if config
+        .rpc
+        .expected_genesis_hash
+        .as_deref()
+        .is_some_and(|hash| hash != known)
+    {
+        return fail("expected_genesis_hash disagrees with the selected cluster");
+    }
+    Ok(known)
 }
 
 pub struct TokenAccount {
@@ -20,7 +67,6 @@ pub struct TokenAccount {
     pub mint: Pubkey,
     pub raw_amount: u64,
     pub decimals: u8,
-    pub display_amount: String,
 }
 
 impl Rpc {
@@ -29,13 +75,14 @@ impl Rpc {
             .rpc
             .url
             .as_ref()
-            .ok_or("RPC is not configured in config.toml")?;
+            .ok_or("RPC is not configured; use config to set the RPC URL and cluster")?;
         let endpoint = reqwest::Url::parse(url)?
             .host_str()
             .ok_or("RPC URL has no host")?
             .to_owned();
         let client = Client::builder()
             .timeout(config.rpc_timeout())
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
@@ -43,12 +90,34 @@ impl Rpc {
             url: url.clone(),
             cluster: config.rpc.cluster.clone(),
             endpoint,
+            timeout: config.rpc_timeout(),
+            expected_genesis: expected_genesis(config)?.to_owned(),
         })
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_with_timeout(method, params, self.timeout)
+    }
+
+    pub fn verify_cluster(&self) -> Result<()> {
+        let result = self.call("getGenesisHash", json!([]))?;
+        if result.as_str() != Some(&self.expected_genesis) {
+            return fail(
+                "RPC genesis hash does not match the configured cluster; refusing operation",
+            );
+        }
+        Ok(())
+    }
+
+    fn call_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let request = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
-        let mut response = self.client.post(&self.url).json(&request).send()?;
+        let mut response = self
+            .client
+            .post(&self.url)
+            .timeout(timeout)
+            .json(&request)
+            .send()
+            .map_err(reqwest::Error::without_url)?;
         if !response.status().is_success() {
             return Err(format!("RPC {method}: HTTP {}", response.status()).into());
         }
@@ -60,13 +129,18 @@ impl Rpc {
         if body.len() as u64 > MAX_BODY {
             return fail("RPC response exceeds 2 MiB");
         }
-        let parsed: Value = serde_json::from_slice(&body)?;
+        let mut parsed: Value = serde_json::from_slice(&body)?;
+        if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || parsed.get("id").and_then(Value::as_u64) != Some(1)
+        {
+            return fail("invalid JSON-RPC envelope");
+        }
         if let Some(error) = parsed.get("error") {
             return Err(format!("RPC {method}: {}", safe_text(&error.to_string(), 500)).into());
         }
         parsed
-            .get("result")
-            .cloned()
+            .get_mut("result")
+            .map(Value::take)
             .ok_or_else(|| "RPC result missing".into())
     }
 
@@ -120,13 +194,32 @@ impl Rpc {
         Ok(u8::try_from(decimals)?)
     }
 
-    pub fn latest_blockhash(&self) -> Result<Hash> {
+    pub fn latest_blockhash(&self) -> Result<BlockhashContext> {
         let result = self.call("getLatestBlockhash", json!([{"commitment":"confirmed"}]))?;
         let hash = result
             .pointer("/value/blockhash")
             .and_then(Value::as_str)
             .ok_or("invalid getLatestBlockhash response")?;
-        Ok(Hash::from_str(hash)?)
+        Ok(BlockhashContext {
+            hash: Hash::from_str(hash)?,
+            last_valid_block_height: result
+                .pointer("/value/lastValidBlockHeight")
+                .and_then(Value::as_u64)
+                .ok_or("missing blockhash expiry")?,
+            context_slot: result
+                .pointer("/context/slot")
+                .and_then(Value::as_u64)
+                .ok_or("missing blockhash context")?,
+        })
+    }
+
+    pub fn block_height(&self, context: &BlockhashContext) -> Result<u64> {
+        self.call(
+            "getBlockHeight",
+            json!([{"commitment":"confirmed", "minContextSlot":context.context_slot}]),
+        )?
+        .as_u64()
+        .ok_or_else(|| "invalid block height".into())
     }
 
     pub fn fee_for_message(&self, message: &VersionedMessage) -> Result<u64> {
@@ -170,14 +263,42 @@ impl Rpc {
     }
 
     pub fn simulate(&self, wire: &[u8]) -> Result<Value> {
+        self.simulate_at(wire, 0)
+    }
+    pub fn simulate_at(&self, wire: &[u8], min_context_slot: u64) -> Result<Value> {
         let result = self.call("simulateTransaction", json!([
-            STANDARD.encode(wire), {"encoding":"base64", "sigVerify":false, "commitment":"confirmed"}
+            STANDARD.encode(wire), {"encoding":"base64", "sigVerify":false, "commitment":"confirmed", "minContextSlot": min_context_slot}
         ]))?;
         let value = result.get("value").ok_or("invalid simulation response")?;
         if value.get("err").is_none() {
             return fail("simulation result is missing err field");
         }
         Ok(value.clone())
+    }
+
+    pub fn submit_and_confirm(
+        &self,
+        wire: &[u8],
+        signature: solana_transaction::Signature,
+    ) -> SubmissionOutcome {
+        let expected = signature.to_string();
+        let result = (|| -> Result<bool> {
+            if self.send(wire)? != expected {
+                return fail("RPC returned a different transaction signature");
+            }
+            self.confirm(&expected)
+        })();
+        match result {
+            Ok(true) => SubmissionOutcome::Confirmed(signature),
+            Ok(false) => SubmissionOutcome::Unknown {
+                signature,
+                reason: "confirmation deadline or poll budget reached".into(),
+            },
+            Err(error) => SubmissionOutcome::Unknown {
+                signature,
+                reason: safe_text(&error.to_string(), 500),
+            },
+        }
     }
 
     pub fn send(&self, wire: &[u8]) -> Result<String> {
@@ -192,10 +313,16 @@ impl Rpc {
     }
 
     pub fn confirm(&self, signature: &str) -> Result<bool> {
+        let deadline = Instant::now() + Duration::from_secs(60);
         for _ in 0..20 {
-            let result = self.call(
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let result = self.call_with_timeout(
                 "getSignatureStatuses",
                 json!([[signature], {"searchTransactionHistory":false}]),
+                self.timeout.min(remaining),
             )?;
             let status = result
                 .pointer("/value/0")
@@ -215,7 +342,9 @@ impl Rpc {
                     return Ok(true);
                 }
             }
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(
+                Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         Ok(false)
     }
@@ -262,17 +391,11 @@ fn parse_token_accounts(result: &Value, token_program: &Pubkey) -> Result<Vec<To
             .pointer("/tokenAmount/decimals")
             .and_then(Value::as_u64)
             .ok_or("invalid token decimals")?;
-        let display_amount = info
-            .pointer("/tokenAmount/uiAmountString")
-            .and_then(Value::as_str)
-            .or_else(|| info.pointer("/tokenAmount/amount").and_then(Value::as_str))
-            .ok_or("invalid token amount")?;
         accounts.push(TokenAccount {
             address: Pubkey::from_str(address)?,
             mint: Pubkey::from_str(mint)?,
             raw_amount,
             decimals: u8::try_from(decimals)?,
-            display_amount: display_amount.into(),
         });
     }
     Ok(accounts)
@@ -289,6 +412,63 @@ pub fn safe_text(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mismatched_genesis_is_rejected_and_correct_genesis_passes() {
+        let (rpc, server) = crate::test_support::mock_rpc(vec![json!("wrong")]);
+        assert!(rpc.verify_cluster().is_err());
+        assert_eq!(server.join().unwrap()[0]["method"], "getGenesisHash");
+        let (rpc, server) = crate::test_support::mock_rpc(vec![json!(
+            expected_genesis(&Config::default()).unwrap()
+        )]);
+        rpc.verify_cluster().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn mismatched_and_malformed_send_responses_keep_the_local_signature() {
+        let signature = solana_transaction::Signature::from([7; 64]);
+        for response in [json!("different"), json!(42)] {
+            let (rpc, server) = crate::test_support::mock_rpc(vec![response]);
+            let SubmissionOutcome::Unknown {
+                signature: actual, ..
+            } = rpc.submit_and_confirm(&[0; 5], signature)
+            else {
+                panic!("expected unknown outcome")
+            };
+            assert_eq!(actual, signature);
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["method"], "sendTransaction");
+        }
+    }
+
+    #[test]
+    fn successful_submission_confirms_only_the_local_signature() {
+        let signature = solana_transaction::Signature::from([7; 64]);
+        let (rpc, server) = crate::test_support::mock_rpc(vec![
+            json!(signature.to_string()),
+            json!({"value":[{"err":null,"confirmationStatus":"confirmed"}]}),
+        ]);
+        assert!(
+            matches!(rpc.submit_and_confirm(&[0; 5], signature), SubmissionOutcome::Confirmed(actual) if actual == signature)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests[1]["params"][0][0], signature.to_string());
+    }
+
+    #[test]
+    fn confirmation_error_still_retains_signature() {
+        let signature = solana_transaction::Signature::from([7; 64]);
+        let (rpc, server) = crate::test_support::mock_rpc(vec![
+            json!(signature.to_string()),
+            json!({"value":[{"err":{"InstructionError":[0,"error"]}}]}),
+        ]);
+        assert!(
+            matches!(rpc.submit_and_confirm(&[0; 5], signature), SubmissionOutcome::Unknown { signature: actual, .. } if actual == signature)
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
 
     #[test]
     fn rpc_rejects_redirects_without_contacting_the_target() {
@@ -344,7 +524,6 @@ mod tests {
         let accounts = parse_token_accounts(&response, &program).unwrap();
         assert_eq!(accounts[0].raw_amount, 0);
         assert_eq!(accounts[0].decimals, 2);
-        assert_eq!(accounts[0].display_amount, "0.00");
         response["value"][0]["account"]["owner"] = Value::String(mint.to_string());
         assert!(parse_token_accounts(&response, &program).is_err());
     }

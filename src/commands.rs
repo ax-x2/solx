@@ -1,24 +1,23 @@
+use crate::secret::{LockedBytes, LockedKeypair};
 use crate::{
     App, Result,
-    config::{self, valid_name},
+    config::valid_name,
     fail,
     rpc::{Rpc, TokenAccount, safe_text},
     signer::Keypair,
     vault::{self, Session},
 };
-use bip39::Mnemonic;
 use serde_json::Value;
 use solana_message::{AccountMeta, Hash, Instruction, VersionedMessage, v0};
 use solana_pubkey::Pubkey;
 use solana_transaction::{Signature, versioned::VersionedTransaction};
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Read, Write},
     path::Path,
     str::FromStr,
 };
-use zeroize::Zeroizing;
 
 const SYSTEM: Pubkey = Pubkey::from_str_const("11111111111111111111111111111111");
 const TOKEN: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -42,6 +41,11 @@ pub struct Plugin {
 
 pub static PLUGINS: &[Plugin] = &[
     Plugin {
+        name: "config",
+        summary: "edit vault settings or show authenticated settings history",
+        run: crate::settings::run,
+    },
+    Plugin {
         name: "help",
         summary: "show commands",
         run: help,
@@ -53,7 +57,7 @@ pub static PLUGINS: &[Plugin] = &[
     },
     Plugin {
         name: "new",
-        summary: "derive a wallet or create a new master",
+        summary: "create a new recovery phrase, or share one with --wallet NAME",
         run: new_wallet,
     },
     Plugin {
@@ -68,7 +72,7 @@ pub static PLUGINS: &[Plugin] = &[
     },
     Plugin {
         name: "list",
-        summary: "list wallets and balances",
+        summary: "list wallets; query balances when enabled in config",
         run: list,
     },
     Plugin {
@@ -111,13 +115,13 @@ pub static PLUGINS: &[Plugin] = &[
 fn help(_: &mut App, args: &[String]) -> Result<()> {
     no_args(args)?;
     println!(
-        "Usage: solx [--config PATH] <command> [options]\n       solx shell\n       solx   (opens CLI shell)"
+        "Usage: solx [--vault PATH] <command> [options]\n       solx shell\n       solx config\n       solx config show"
     );
     for plugin in PLUGINS {
         println!("  {:<15} {}", plugin.name, plugin.summary);
     }
     println!(
-        "\nCommands:\n  solx init [NAME]\n  solx new NAME [--new-master]\n  solx import NAME (--mnemonic | --base58 [KEY] | --keypair-file PATH)\n  solx export NAME (--private-key | --mnemonic)\n  solx list [--wallet NAME]\n  solx delete NAME\n  solx history [--wallet NAME] [--limit N]\n  solx transfer --wallet NAME --to ADDRESS --amount SOL|ALL\n  solx token-transfer --wallet NAME --mint MINT --to ADDRESS --amount TOKENS\n  solx close-ata [--wallet NAME] [--burn] (--all | MINT [MINT ...])"
+        "\nCommands:\n  solx init [NAME]\n  solx new NAME [--wallet SOURCE]\n  solx import NAME (--mnemonic | --base58 | --keypair-file PATH)\n  solx export NAME (--private-key | --mnemonic)\n  solx list [NAME]\n  solx delete NAME\n  solx history [--wallet NAME] [--limit N]\n  solx transfer --wallet NAME --to ADDRESS --amount SOL|ALL\n  solx token-transfer --wallet NAME --mint MINT --to ADDRESS --amount TOKENS\n  solx close-ata [--wallet NAME] [--burn] (--all | MINT [MINT ...])"
     );
     Ok(())
 }
@@ -141,21 +145,20 @@ fn init(app: &mut App, args: &[String]) -> Result<()> {
     if app.config.vault.exists() {
         return fail("vault already exists");
     }
-    let password = Zeroizing::new(rpassword::prompt_password("New vault password: ")?);
-    let confirmation = Zeroizing::new(rpassword::prompt_password("Repeat password: ")?);
+    crate::kdf::prepare_memlock_allowance()?;
+    let password = crate::secret::prompt("New vault password: ", 1024)?;
+    let confirmation = crate::secret::prompt("Repeat password: ", 1024)?;
     if password != confirmation {
         return fail("passwords do not match");
     }
     if password.len() < 12 {
-        return fail("password must be at least 12 characters");
+        return fail("password must be at least 12 bytes");
     }
     let entropy = vault::fresh_entropy()?;
     let phrase = vault::phrase(&entropy)?;
     let mut data = vault::Vault::default();
+    data.config = app.config.clone();
     data.add_master(name, entropy)?;
-    if !app.config_path.exists() {
-        write_example_config(&app.config_path)?;
-    }
     let session = Session::create(&app.config.vault, &password, &mut data)?;
     let account = data.account(name)?;
     println!("Created {name}: {}", account.pubkey);
@@ -169,131 +172,154 @@ fn init(app: &mut App, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn write_example_config(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or("config path needs a parent directory")?;
-    let existed = parent.exists();
-    if !existed {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if !existed {
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(config::EXAMPLE.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+fn new_wallet(app: &mut App, args: &[String]) -> Result<()> {
+    new_wallet_with_output(app, args, &mut io::stdout())
 }
 
-fn new_wallet(app: &mut App, args: &[String]) -> Result<()> {
-    if args.is_empty() || args.len() > 2 || (args.len() == 2 && args[1] != "--new-master") {
-        return fail("usage: solx new NAME [--new-master]");
+fn new_wallet_with_output(app: &mut App, args: &[String], output: &mut impl Write) -> Result<()> {
+    let (name, source) = match args {
+        [name] => (name.as_str(), None),
+        [name, flag, source] if flag == "--wallet" => (name.as_str(), Some(source.as_str())),
+        _ => return fail("usage: solx new NAME [--wallet SOURCE]"),
+    };
+    if !valid_name(name) || name.starts_with('-') {
+        return fail("invalid new wallet name; usage: solx new NAME [--wallet SOURCE]");
     }
-    let name = &args[0];
+    if source.is_some_and(|source| !valid_name(source) || source.starts_with('-')) {
+        return fail("invalid source wallet name; usage: solx new NAME [--wallet SOURCE]");
+    }
     let mut data = app.vault()?;
-    if args.len() == 2 {
+    if let Some(source) = source {
+        data.add_derived(name, source)?;
+        app.save_vault(&mut data)?;
+        writeln!(output, "Created {name}: {}", data.account(name)?.pubkey)?;
+        writeln!(output, "Shared recovery phrase with {source}.")?;
+        writeln!(
+            output,
+            "Derivation path: m/44'/501'/{}'/0'",
+            data.derivation_index(name)?
+                .ok_or("missing derivation index")?
+        )?;
+    } else {
         let entropy = vault::fresh_entropy()?;
         let phrase = vault::phrase(&entropy)?;
         data.add_master(name, entropy)?;
         app.save_vault(&mut data)?;
-        println!("Created {name}: {}", data.account(name)?.pubkey);
-        println!(
-            "Recovery phrase (shown once; store it securely):\n{}",
+        writeln!(output, "Created {name}: {}", data.account(name)?.pubkey)?;
+        writeln!(
+            output,
+            "New recovery phrase (shown once; store it securely):\n{}",
             phrase.as_str()
-        );
-    } else {
-        data.add_derived(name)?;
-        app.save_vault(&mut data)?;
-        println!("Derived {name}: {}", data.account(name)?.pubkey);
+        )?;
     }
+    output.flush()?;
     Ok(())
 }
 
 fn import(app: &mut App, args: &[String]) -> Result<()> {
     if args.len() < 2 || args.len() > 3 {
-        return fail("usage: solx import NAME (--mnemonic | --base58 [KEY] | --keypair-file PATH)");
+        return fail("usage: solx import NAME (--mnemonic | --base58 | --keypair-file PATH)");
     }
-    if args[1] == "--base58" && args.len() == 3 && !app.shell {
-        return fail(
-            "inline private keys are only accepted in the CLI shell; omit KEY for a hidden prompt",
-        );
+    if args[1] == "--base58" && args.len() == 3 {
+        return fail("inline private keys are disabled; omit KEY for a hidden prompt");
     }
     let name = &args[0];
-    let mut data = app.vault()?;
+    let data = app.public_vault()?;
     if data.contains(name) {
         return fail("wallet name already exists");
     }
-    match args[1].as_str() {
+    enum ImportedSecret {
+        Mnemonic(LockedBytes),
+        Key(LockedKeypair),
+    }
+    let imported = match args[1].as_str() {
         "--mnemonic" if args.len() == 2 => {
-            let phrase = Zeroizing::new(rpassword::prompt_password("Mnemonic (hidden): ")?);
-            let mnemonic = Mnemonic::parse(&*phrase)?;
-            let entropy = Zeroizing::new(mnemonic.to_entropy());
-            data.add_master(name, entropy)?;
+            let phrase = crate::secret::prompt("Mnemonic (hidden): ", 1024)?;
+            let entropy = vault::parse_phrase(&phrase)?;
+            ImportedSecret::Mnemonic(entropy)
         }
-        "--base58" if args.len() == 2 || args.len() == 3 => {
-            let prompted = if args.len() == 2 {
-                Some(Zeroizing::new(rpassword::prompt_password(
-                    "Base58 private key (hidden): ",
-                )?))
-            } else {
-                None
-            };
-            let secret = prompted
-                .as_ref()
-                .map(|value| value.as_str())
-                .unwrap_or_else(|| args[2].as_str());
-            data.add_imported(name, decode_base58_keypair(secret)?)?;
+        "--base58" if args.len() == 2 => {
+            let secret = crate::secret::prompt("Base58 private key (hidden): ", 90)?;
+            ImportedSecret::Key(decode_base58_keypair(&secret)?)
         }
         "--keypair-file" if args.len() == 3 => {
             let path = Path::new(&args[2]);
-            let file = fs::File::open(path)?;
-            if file.metadata()?.len() > 1024 {
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let mut file = options.open(path)?;
+            if !file.metadata()?.is_file() || file.metadata()?.len() > 1024 {
                 return fail("keypair file is too large");
             }
-            let mut contents = Zeroizing::new(Vec::with_capacity(256));
-            file.take(1025).read_to_end(&mut contents)?;
-            if contents.len() > 1024 {
+            let mut contents = LockedBytes::zeroed(1025)?;
+            let mut length = 0;
+            while length < contents.len() {
+                let read = file.read(&mut contents[length..])?;
+                if read == 0 {
+                    break;
+                }
+                length += read;
+            }
+            if length > 1024 {
                 return fail("keypair file is too large");
             }
-            let numbers: Vec<u8> = serde_json::from_slice(&contents)?;
-            let numbers = Zeroizing::new(numbers);
-            let bytes = Zeroizing::new(
-                <[u8; 64]>::try_from(numbers.as_slice())
-                    .map_err(|_| "keypair file must have 64 bytes")?,
-            );
-            data.add_imported(name, bytes)?;
+            let bytes = parse_keypair_json(&contents[..length])?;
+            ImportedSecret::Key(bytes)
         }
         _ => {
-            return fail(
-                "usage: solx import NAME (--mnemonic | --base58 [KEY] | --keypair-file PATH)",
-            );
+            return fail("usage: solx import NAME (--mnemonic | --base58 | --keypair-file PATH)");
         }
+    };
+    let mut data = app.vault()?;
+    match imported {
+        ImportedSecret::Mnemonic(entropy) => data.add_master(name, entropy)?,
+        ImportedSecret::Key(bytes) => data.add_imported(name, bytes)?,
     }
     app.save_vault(&mut data)?;
     println!("Imported {name}: {}", data.account(name)?.pubkey);
     if args[1] == "--keypair-file" {
         eprintln!("Warning: the source keypair file is still on disk.");
-    } else if args[1] == "--base58" && args.len() == 3 {
-        eprintln!(
-            "Warning: the key was visible in your terminal; use --base58 without KEY for a hidden prompt."
-        );
     }
     Ok(())
 }
 
-fn decode_base58_keypair(input: &str) -> Result<Zeroizing<[u8; 64]>> {
+fn parse_keypair_json(input: &[u8]) -> Result<LockedKeypair> {
+    use serde::de::{Error, SeqAccess, Visitor};
+    struct KeyVisitor(LockedKeypair);
+    impl<'de> Visitor<'de> for KeyVisitor {
+        type Value = LockedKeypair;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("exactly 64 keypair bytes")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut bytes = self.0;
+            for byte in bytes.iter_mut() {
+                *byte = sequence
+                    .next_element()?
+                    .ok_or_else(|| A::Error::custom("keypair needs 64 bytes"))?;
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom("keypair has excess bytes"));
+            }
+            Ok(bytes)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(input);
+    let bytes =
+        serde::Deserializer::deserialize_seq(&mut decoder, KeyVisitor(LockedKeypair::new()?))
+            .map_err(|_| "invalid keypair JSON; expected exactly 64 bytes")?;
+    decoder.end().map_err(|_| "trailing keypair JSON data")?;
+    Ok(bytes)
+}
+
+fn decode_base58_keypair(input: &str) -> Result<LockedKeypair> {
     let input = input
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
@@ -303,12 +329,11 @@ fn decode_base58_keypair(input: &str) -> Result<Zeroizing<[u8; 64]>> {
                 .and_then(|value| value.strip_suffix('\''))
         })
         .unwrap_or(input);
-    let mut bytes = Zeroizing::new([0u8; 64]);
+    let mut bytes = LockedKeypair::new()?;
     let len = bs58::decode(input).onto(&mut bytes[..])?;
     match len {
         32 => {
-            let secret: [u8; 32] = bytes[..32].try_into()?;
-            let pubkey = Keypair::new_from_array(secret).pubkey();
+            let pubkey = Keypair::from_seed_bytes(bytes[..32].try_into()?)?.pubkey();
             bytes[32..].copy_from_slice(pubkey.as_ref());
         }
         64 => {}
@@ -335,16 +360,34 @@ fn parse_export(args: &[String]) -> Result<(&str, ExportKind)> {
 fn export(app: &mut App, args: &[String]) -> Result<()> {
     let (name, kind) = parse_export(args)?;
     let data = app.vault()?;
-    // Do not hold a stdout lock while waiting for the user's confirmation.
-    export_wallet(
-        &data,
-        name,
-        kind,
-        crate::read_bounded_line,
-        &mut io::stdout(),
-    )
+    let expected = data.account(name)?.pubkey;
+    let index = data.derivation_index(name)?;
+    if matches!(kind, ExportKind::Mnemonic) && index.is_none() {
+        return fail("imported private-key wallets have no stored recovery phrase");
+    }
+    drop(data);
+    app.release_session();
+    println!("Export wallet: {name}\nAddress: {expected}");
+    if matches!(kind, ExportKind::Mnemonic) {
+        println!(
+            "Derivation path: m/44'/501'/{}'/0'\nThis phrase controls every account derived from this master.",
+            index.unwrap()
+        );
+    }
+    println!("Warning: secret output can remain in terminal scrollback or redirected files.");
+    print!("Type '{name}' to reveal the secret: ");
+    io::stdout().flush()?;
+    if crate::read_bounded_line()?.as_deref().map(str::trim) != Some(name) {
+        return fail("export cancelled");
+    }
+    let data = app.vault()?;
+    if data.account(name)?.pubkey != expected || data.derivation_index(name)? != index {
+        return fail("wallet changed after export approval");
+    }
+    write_export_secret(&data, name, kind, &mut io::stdout())
 }
 
+#[cfg(test)]
 fn export_wallet(
     data: &vault::Vault,
     name: &str,
@@ -383,10 +426,19 @@ fn export_wallet(
     if read_line()?.as_deref().map(str::trim) != Some(name) {
         return fail("export cancelled");
     }
+    write_export_secret(data, name, kind, output)
+}
+
+fn write_export_secret(
+    data: &vault::Vault,
+    name: &str,
+    kind: ExportKind,
+    output: &mut impl Write,
+) -> Result<()> {
     match kind {
         ExportKind::PrivateKey => {
-            let bytes = data.signer(name)?.to_keypair_bytes();
-            let mut encoded = Zeroizing::new([0u8; 88]);
+            let bytes = data.signer(name)?.to_keypair_bytes()?;
+            let mut encoded = LockedBytes::zeroed(88)?;
             let len = bs58::encode(&bytes[..]).onto(&mut encoded[..])?;
             let text = std::str::from_utf8(&encoded[..len])?;
             writeln!(
@@ -411,9 +463,18 @@ fn delete(app: &mut App, args: &[String]) -> Result<()> {
     let [name] = args else {
         return fail("usage: solx delete NAME");
     };
-    let mut data = app.vault()?;
+    let data = app.vault()?;
     let was_default = data.first_name()? == name;
-    let erase_phrase = confirm_delete(&data, name, crate::read_bounded_line)?;
+    let pubkey = data.account(name)?.pubkey;
+    let usage = data.recovery_phrase_use(name)?;
+    let revision = data.revision().map(<[u8]>::to_vec);
+    drop(data);
+    app.release_session();
+    let erase_phrase = confirm_delete_metadata(name, pubkey, usage, crate::read_bounded_line)?;
+    let mut data = app.vault()?;
+    if data.revision() != revision.as_deref() {
+        return fail("vault changed after deletion approval; review again");
+    }
     data.remove_account(name, erase_phrase)?;
     app.save_vault(&mut data)?;
     println!("Deleted local wallet {name}.");
@@ -429,14 +490,24 @@ fn delete(app: &mut App, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn confirm_delete(
     data: &vault::Vault,
     name: &str,
-    mut read_line: impl FnMut() -> io::Result<Option<String>>,
+    read_line: impl FnMut() -> io::Result<Option<String>>,
 ) -> Result<bool> {
     let account = data.account(name)?;
     let usage = data.recovery_phrase_use(name)?;
-    println!("Delete local wallet: {name}\nAddress: {}", account.pubkey);
+    confirm_delete_metadata(name, account.pubkey, usage, read_line)
+}
+
+fn confirm_delete_metadata(
+    name: &str,
+    pubkey: Pubkey,
+    usage: vault::RecoveryPhraseUse,
+    mut read_line: impl FnMut() -> io::Result<Option<String>>,
+) -> Result<bool> {
+    println!("Delete local wallet: {name}\nAddress: {pubkey}");
     println!("Funds stay on-chain. Keep a backup if you need access later.");
     match usage {
         vault::RecoveryPhraseUse::ImportedKey => println!("The saved private key will be removed."),
@@ -466,17 +537,24 @@ fn confirm_delete(
 }
 
 fn list(app: &mut App, args: &[String]) -> Result<()> {
-    let options = Options::parse(args, &["wallet"])?;
-    let data = app.vault()?;
-    let filter = options.get("wallet");
+    list_with_output(app, args, &mut io::stdout())
+}
+
+fn list_with_output(app: &mut App, args: &[String], output: &mut impl Write) -> Result<()> {
+    let filter = match args {
+        [] => None,
+        [name] => Some(name.as_str()),
+        _ => return fail("usage: solx list [NAME]"),
+    };
+    let data = app.public_vault()?;
     if let Some(name) = filter {
         data.account(name)?;
     }
     if data.accounts.is_empty() {
-        println!("No saved wallets.");
+        writeln!(output, "No saved wallets.")?;
         return Ok(());
     }
-    let rpc = if app.config.rpc.url.is_some() {
+    let rpc = if app.config.rpc.show_balances && app.config.rpc.url.is_some() {
         Some(app.rpc()?)
     } else {
         None
@@ -486,21 +564,22 @@ fn list(app: &mut App, args: &[String]) -> Result<()> {
         .iter()
         .filter(|a| filter.is_none_or(|name| a.name == name))
     {
-        println!("{}  {}", account.name, account.pubkey);
+        writeln!(output, "{}  {}", account.name, account.pubkey)?;
         if let Some(rpc) = &rpc {
             let balance = rpc.balance(&account.pubkey)?;
-            println!("  SOL: {}", format_amount(balance, 9));
+            writeln!(output, "  SOL: {}", format_amount(balance, 9))?;
             if balance == 0 {
                 eprintln!("  Warning: {} has zero SOL balance", account.name);
             }
             for program in [TOKEN, TOKEN_2022] {
                 for token_account in rpc.token_accounts(&account.pubkey, &program)? {
-                    println!(
+                    writeln!(
+                        output,
                         "  token {}  {}  account {}",
                         token_account.mint,
-                        safe_text(&token_account.display_amount, 60),
+                        format_amount(token_account.raw_amount, token_account.decimals),
                         token_account.address
-                    );
+                    )?;
                 }
             }
         }
@@ -510,7 +589,7 @@ fn list(app: &mut App, args: &[String]) -> Result<()> {
 
 fn history(app: &mut App, args: &[String]) -> Result<()> {
     let options = Options::parse(args, &["wallet", "limit"])?;
-    let data = app.vault()?;
+    let data = app.public_vault()?;
     let name = data.name_or_first(options.get("wallet"))?;
     let account = data.account(name)?;
     let limit = options
@@ -583,9 +662,9 @@ fn system_transfer(source: &Pubkey, target: &Pubkey, lamports: u64) -> Instructi
 
 fn transfer(app: &mut App, args: &[String]) -> Result<()> {
     let options = Options::parse(args, &["wallet", "to", "amount"])?;
-    let data = app.vault()?;
+    let data = app.public_vault()?;
     let source_name = data.name_or_first(options.get("wallet"))?;
-    let source = data.signer(source_name)?;
+    let source = data.account(source_name)?;
     let target = target_address(&data, options.required("to")?)?;
     let amount_text = options.required("amount")?;
     let all = amount_text == "ALL";
@@ -625,7 +704,7 @@ fn transfer(app: &mut App, args: &[String]) -> Result<()> {
     if send_transaction(
         app,
         &rpc,
-        &source,
+        source,
         vec![instruction],
         &details,
         false,
@@ -639,9 +718,9 @@ fn transfer(app: &mut App, args: &[String]) -> Result<()> {
 
 fn token_transfer(app: &mut App, args: &[String]) -> Result<()> {
     let options = Options::parse(args, &["wallet", "mint", "to", "amount"])?;
-    let data = app.vault()?;
+    let data = app.public_vault()?;
     let source_name = data.name_or_first(options.get("wallet"))?;
-    let source = data.signer(source_name)?;
+    let source = data.account(source_name)?;
     let mint = Pubkey::from_str(options.required("mint")?)?;
     let target = target_address(&data, options.required("to")?)?;
     if source.pubkey() == target {
@@ -649,6 +728,7 @@ fn token_transfer(app: &mut App, args: &[String]) -> Result<()> {
     }
     let rpc = app.rpc()?;
     let token_program = mint_program(&rpc, &mint)?;
+    ensure_transfer_program(token_program)?;
     let decimals = rpc.token_decimals(&mint)?;
     let amount = parse_amount(options.required("amount")?, decimals)?;
     if amount == 0 {
@@ -684,7 +764,7 @@ fn token_transfer(app: &mut App, args: &[String]) -> Result<()> {
         target,
         destination_ata
     );
-    if send_transaction(app, &rpc, &source, instructions, &details, false, None)?
+    if send_transaction(app, &rpc, source, instructions, &details, false, None)?
         && !data.is_known_recipient(&target)
     {
         app.remember_recipient(&target);
@@ -740,9 +820,9 @@ struct CloseSelection {
 
 fn close_ata(app: &mut App, args: &[String]) -> Result<()> {
     let selection = parse_close_selection(args)?;
-    let data = app.vault()?;
+    let data = app.public_vault()?;
     let name = data.name_or_first(selection.wallet.as_deref())?;
-    let signer = data.signer(name)?;
+    let signer = data.account(name)?;
     let rpc = app.rpc()?;
     let candidates = if selection.all {
         let (candidates, nonempty, non_ata) =
@@ -755,7 +835,7 @@ fn close_ata(app: &mut App, args: &[String]) -> Result<()> {
     } else {
         selected_atas(&rpc, &signer.pubkey(), &selection.mints, selection.burn)?
     };
-    send_close_batches(app, &rpc, &signer, name, candidates)
+    send_close_batches(app, &rpc, signer, name, candidates)
 }
 
 fn parse_close_selection(args: &[String]) -> Result<CloseSelection> {
@@ -905,9 +985,9 @@ fn close_batch_fits(owner: &Pubkey, instructions: &[Instruction], budget: bool) 
 }
 
 fn send_close_batch(
-    app: &App,
+    app: &mut App,
     rpc: &Rpc,
-    signer: &Keypair,
+    signer: &vault::PublicAccount,
     name: &str,
     instructions: Vec<Instruction>,
     candidates: &[CloseCandidate],
@@ -956,9 +1036,9 @@ fn send_close_batch(
 }
 
 fn send_close_batches(
-    app: &App,
+    app: &mut App,
     rpc: &Rpc,
-    signer: &Keypair,
+    signer: &vault::PublicAccount,
     name: &str,
     candidates: Vec<CloseCandidate>,
 ) -> Result<()> {
@@ -1061,7 +1141,7 @@ impl<'a> Options<'a> {
     }
 }
 
-fn target_address(data: &vault::Vault, value: &str) -> Result<Pubkey> {
+fn target_address(data: &vault::PublicVault, value: &str) -> Result<Pubkey> {
     if data.contains(value) {
         Ok(data.account(value)?.pubkey)
     } else {
@@ -1069,7 +1149,7 @@ fn target_address(data: &vault::Vault, value: &str) -> Result<Pubkey> {
     }
 }
 
-fn warn_destination(data: &vault::Vault, rpc: &Rpc, target: &Pubkey) -> Result<()> {
+fn warn_destination(data: &vault::PublicVault, rpc: &Rpc, target: &Pubkey) -> Result<()> {
     if !data.is_known_recipient(target) {
         eprintln!("Warning: first transfer to {target}");
     }
@@ -1092,6 +1172,15 @@ fn mint_program(rpc: &Rpc, mint: &Pubkey) -> Result<Pubkey> {
         return fail("mint is not owned by an SPL Token program");
     }
     Ok(owner)
+}
+
+fn ensure_transfer_program(program: Pubkey) -> Result<()> {
+    if program != TOKEN {
+        return fail(
+            "Token-2022 transfers are disabled until extension fees and net receipts can be reviewed and enforced; legacy SPL transfers remain supported",
+        );
+    }
+    Ok(())
 }
 
 fn ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
@@ -1207,9 +1296,9 @@ fn close_token_account(account: &Pubkey, authority: &Pubkey, program: Pubkey) ->
 }
 
 fn send_transaction(
-    app: &App,
+    app: &mut App,
     rpc: &Rpc,
-    signer: &Keypair,
+    signer: &vault::PublicAccount,
     mut instructions: Vec<Instruction>,
     details: &str,
     burn_confirmation: bool,
@@ -1218,7 +1307,7 @@ fn send_transaction(
     if instructions.is_empty() {
         return fail("invalid instruction count");
     }
-    let hash = rpc.latest_blockhash()?;
+    let hash = rpc.latest_blockhash()?.hash;
     let optimize =
         app.config.security.simulate_before_send && app.config.security.optimize_compute_units;
     if optimize {
@@ -1244,6 +1333,8 @@ fn send_transaction(
         None
     };
     let (unsigned, simulation_wire) = compile_unsigned(&signer.pubkey(), &instructions, hash)?;
+    let approved_fee = rpc.fee_for_message(&unsigned.message)?;
+    let approved_rent = ata_rent_quote(rpc, &instructions)?;
     if let Some((_, expected_fee, _)) = all_quote {
         let final_fee = rpc.fee_for_message(&unsigned.message)?;
         if final_fee != expected_fee {
@@ -1251,12 +1342,17 @@ fn send_transaction(
         }
     }
     println!(
-        "\n{OUTPUT_RULE}\nTransaction\n\nConfigured cluster: {}\nRPC host: {}\nFee payer: {}",
+        "\n{OUTPUT_RULE}\nTransaction\n\nGenesis-checked cluster: {}\nRPC host: {}\nFee payer: {}",
         safe_text(&rpc.cluster, 80),
         safe_text(&rpc.endpoint, 150),
         signer.pubkey()
     );
     println!("{details}");
+    println!(
+        "Network fee: {} SOL\nEstimated ATA rent: {} SOL",
+        format_amount(approved_fee, 9),
+        format_amount(approved_rent, 9)
+    );
     if let Some((balance, fee, amount)) = all_quote {
         println!(
             "Balance: {} SOL\nNetwork fee: {} SOL\nSend: {} SOL\nExpected remaining: 0 SOL",
@@ -1312,7 +1408,19 @@ fn send_transaction(
             return fail("transaction cancelled");
         }
     }
-    let transaction = sign_v0(unsigned.message, signer)?;
+    // Password entry must precede the fresh blockhash, and cannot occur in signing.
+    app.unlock()?;
+    let result = refresh_and_sign(
+        app,
+        rpc,
+        signer,
+        &instructions,
+        approved_fee,
+        approved_rent,
+        spend_all,
+    );
+    app.release_session();
+    let transaction = result?;
     let signature = transaction
         .signatures
         .first()
@@ -1322,26 +1430,96 @@ fn send_transaction(
     if wire.len() > MAX_TRANSACTION_BYTES {
         return fail("signed transaction exceeds 1232-byte packet limit");
     }
-    let returned = match rpc.send(&wire) {
-        Ok(signature) => signature,
-        Err(error) => {
-            return Err(format!(
-                "send outcome unknown; check signature {signature} before retrying: {error}"
-            )
-            .into());
+    println!("Local transaction signature: {signature}");
+    let outcome = rpc.submit_and_confirm(&wire, transaction.signatures[0]);
+    match outcome {
+        crate::rpc::SubmissionOutcome::Confirmed(signature) => {
+            println!("Confirmed: {signature}");
+            Ok(true)
         }
-    };
-    if returned != signature {
-        return fail("RPC returned a different transaction signature");
+        crate::rpc::SubmissionOutcome::Unknown { signature, reason } => {
+            eprintln!(
+                "Submission outcome unknown; check signature {signature} before retrying: {reason}"
+            );
+            Ok(false)
+        }
     }
-    println!("Submitted: {signature}");
-    if rpc.confirm(&signature)? {
-        println!("Confirmed: {signature}");
-        Ok(true)
-    } else {
-        println!("Confirmation pending; check signature: {signature}");
-        Ok(false)
+}
+
+fn ata_rent_quote(rpc: &Rpc, instructions: &[Instruction]) -> Result<u64> {
+    let mut rent = 0u64;
+    for instruction in instructions
+        .iter()
+        .filter(|ix| ix.program_id == ASSOCIATED_TOKEN)
+    {
+        let destination = instruction
+            .accounts
+            .get(1)
+            .ok_or("invalid ATA instruction")?
+            .pubkey;
+        if rpc.account_info(&destination)?.is_none() {
+            let quote = rpc
+                .call(
+                    "getMinimumBalanceForRentExemption",
+                    serde_json::json!([165, {"commitment":"confirmed"}]),
+                )?
+                .as_u64()
+                .ok_or("invalid rent quote")?;
+            rent = rent.checked_add(quote).ok_or("rent overflow")?;
+        }
     }
+    Ok(rent)
+}
+
+fn refresh_and_sign(
+    app: &App,
+    rpc: &Rpc,
+    identity: &vault::PublicAccount,
+    instructions: &[Instruction],
+    fee: u64,
+    rent: u64,
+    spend_all: Option<SpendAll>,
+) -> Result<VersionedTransaction> {
+    let context = rpc.latest_blockhash()?;
+    let (mut transaction, wire) =
+        compile_unsigned(&identity.pubkey, instructions, context.hash.clone())?;
+    if rpc.fee_for_message(&transaction.message)? != fee
+        || ata_rent_quote(rpc, instructions)? != rent
+    {
+        return fail("fee or rent changed after approval; nothing sent, review the command again");
+    }
+    if let Some(all) = spend_all
+        && rpc.balance(&identity.pubkey)? != all.balance
+    {
+        return fail("ALL balance changed after approval; nothing sent, review the command again");
+    }
+    // Final simulation always validates the exact refreshed message, even if the preview was disabled.
+    let simulation = rpc.simulate_at(&wire, context.context_slot)?;
+    check_simulation(&simulation, false, "Final simulation")?;
+    if spend_all.is_some() {
+        ensure_all_would_drain(&simulation)?;
+    }
+    let message = wincode::serialize(&transaction.message)?;
+    let vault = app
+        .session
+        .as_ref()
+        .ok_or("signing session is locked")?
+        .load()?;
+    let key = vault.signer(&identity.name)?;
+    if key.pubkey() != identity.pubkey {
+        return fail("wallet identity changed after approval");
+    }
+    drop(vault);
+    validate_signer(&transaction.message, &key)?;
+    // Disk I/O and derivation must finish before this last expiry check. Only the
+    // selected signer remains live across this bounded RPC; errors drop it too.
+    if rpc.block_height(&context)? >= context.last_valid_block_height.saturating_sub(5) {
+        return fail("fresh transaction is too close to expiry; nothing sent, retry preparation");
+    }
+    // Critical section: prepared message, preallocated signature slot, no I/O or formatting.
+    transaction.signatures[0] = key.sign_message(&message);
+    drop(key);
+    Ok(transaction)
 }
 
 fn compile_unsigned(
@@ -1414,13 +1592,19 @@ fn render_simulation(
     Ok(())
 }
 
-fn sign_v0(message: VersionedMessage, signer: &Keypair) -> Result<VersionedTransaction> {
+fn validate_signer(message: &VersionedMessage, signer: &Keypair) -> Result<()> {
     if !matches!(message, VersionedMessage::V0(_))
         || message.header().num_required_signatures != 1
         || message.static_account_keys().first() != Some(&signer.pubkey())
     {
         return fail("transaction must require only the selected fee payer's signature");
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn sign_v0(message: VersionedMessage, signer: &Keypair) -> Result<VersionedTransaction> {
+    validate_signer(&message, signer)?;
     let bytes = wincode::serialize(&message)?;
     Ok(VersionedTransaction {
         signatures: vec![signer.sign_message(&bytes)],
@@ -1486,6 +1670,463 @@ mod tests {
     use ed25519_dalek::Verifier as _;
 
     #[test]
+    fn new_wallet_defaults_to_independent_phrases_and_derives_from_selected_source() {
+        let mut wallet = crate::test_support::TestWallet::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        wallet.app.config.rpc.url = Some(format!("http://{}", listener.local_addr().unwrap()));
+        wallet.app.config.rpc.show_balances = true;
+        wallet.app.config.rpc.timeout_secs = 1;
+        let session = Session::test_session(&wallet.app.config.vault);
+        for name in ["first", "second"] {
+            let mut output = Vec::new();
+            new_wallet_with_output(&mut wallet.app, &[name.into()], &mut output).unwrap();
+            let saved = session.load().unwrap();
+            assert_eq!(saved.derivation_index(name).unwrap(), Some(0));
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("New recovery phrase (shown once; store it securely):"));
+            assert!(text.contains(saved.mnemonic(name).unwrap().as_str()));
+            assert!(text.contains(&format!(
+                "Created {name}: {}",
+                saved.account(name).unwrap().pubkey
+            )));
+        }
+        let saved = session.load().unwrap();
+        assert_ne!(
+            saved.mnemonic("first").unwrap().as_str(),
+            saved.mnemonic("second").unwrap().as_str()
+        );
+        assert_ne!(
+            saved.account("first").unwrap().pubkey,
+            saved.account("second").unwrap().pubkey
+        );
+        drop(saved);
+
+        for (name, source, index) in [
+            ("child", "second", 1),
+            ("sibling", "child", 2),
+            ("other", "first", 1),
+        ] {
+            let mut output = Vec::new();
+            new_wallet_with_output(
+                &mut wallet.app,
+                &[name.into(), "--wallet".into(), source.into()],
+                &mut output,
+            )
+            .unwrap();
+            let saved = session.load().unwrap();
+            let shared = saved.mnemonic(source).unwrap();
+            assert_eq!(saved.mnemonic(name).unwrap().as_str(), shared.as_str());
+            assert_eq!(saved.derivation_index(name).unwrap(), Some(index));
+            assert_ne!(
+                saved.account(name).unwrap().pubkey,
+                saved.account(source).unwrap().pubkey
+            );
+            assert_eq!(
+                saved.signer(name).unwrap().pubkey(),
+                saved.account(name).unwrap().pubkey
+            );
+            assert_eq!(saved.config_audit().edits(), 0);
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains(&format!("Shared recovery phrase with {source}.")));
+            assert!(text.contains(&format!("m/44'/501'/{index}'/0'")));
+            assert!(!text.contains(shared.as_str()));
+            assert!(!text.contains("New recovery phrase"));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn new_wallet_rejects_removed_options_and_invalid_sources_without_saving() {
+        let mut wallet = crate::test_support::TestWallet::new();
+        let before = fs::read(&wallet.app.config.vault).unwrap();
+        for (args, expected) in [
+            (vec![], "usage:"),
+            (vec!["--new-master"], "invalid new wallet name"),
+            (vec!["child", "--new-master"], "usage:"),
+            (vec!["child", "--wallet"], "usage:"),
+            (vec!["child", "--wallet", "test", "extra"], "usage:"),
+            (
+                vec!["child", "--wallet", "--new-master"],
+                "invalid source wallet name",
+            ),
+            (vec!["bad/name"], "invalid new wallet name"),
+            (vec!["test"], "wallet name already exists"),
+            (vec!["child", "--wallet", "missing"], "unknown wallet"),
+            (
+                vec!["child", "--wallet", "test"],
+                "source wallet has no recovery phrase",
+            ),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let mut output = Vec::new();
+            let error = new_wallet_with_output(&mut wallet.app, &args, &mut output).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(output.is_empty());
+            assert_eq!(fs::read(&wallet.app.config.vault).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn new_wallet_save_failures_do_not_print_success_or_recovery_phrases() {
+        use crate::test_support::{Fault, with_fault};
+        for shared in [false, true] {
+            for fault in [Fault::Write, Fault::Rename, Fault::DirectorySync] {
+                let mut wallet = crate::test_support::TestWallet::new();
+                let session = Session::test_session(&wallet.app.config.vault);
+                let mut initial = session.load().unwrap();
+                initial
+                    .add_master("source", LockedBytes::from_slice(&[0; 32]).unwrap())
+                    .unwrap();
+                session.save(&mut initial).unwrap();
+                drop(initial);
+                let before = fs::read(&wallet.app.config.vault).unwrap();
+                let args = if shared {
+                    vec!["created".into(), "--wallet".into(), "source".into()]
+                } else {
+                    vec!["created".into()]
+                };
+                let mut output = Vec::new();
+                let error = with_fault(fault, || {
+                    new_wallet_with_output(&mut wallet.app, &args, &mut output)
+                })
+                .unwrap_err();
+                assert!(output.is_empty());
+                let saved = session.load().unwrap();
+                assert_eq!(saved.config_audit().edits(), 0);
+                if fault == Fault::DirectorySync {
+                    assert!(error.to_string().contains("vault saved"));
+                    assert!(saved.contains("created"));
+                    assert_eq!(
+                        saved.derivation_index("created").unwrap(),
+                        Some(u32::from(shared))
+                    );
+                } else {
+                    assert_eq!(fs::read(&wallet.app.config.vault).unwrap(), before);
+                    assert!(!saved.contains("created"));
+                    new_wallet_with_output(&mut wallet.app, &args, &mut output).unwrap();
+                    assert_eq!(
+                        session.load().unwrap().derivation_index("created").unwrap(),
+                        Some(u32::from(shared))
+                    );
+                }
+            }
+        }
+    }
+
+    fn listing_wallet() -> crate::test_support::TestWallet {
+        let wallet = crate::test_support::TestWallet::new();
+        let session = wallet.app.session.as_ref().unwrap();
+        let mut data = session.load().unwrap();
+        data.add_imported(
+            "other",
+            Keypair::new_from_array([8; 32]).to_keypair_bytes().unwrap(),
+        )
+        .unwrap();
+        session.save(&mut data).unwrap();
+        wallet
+    }
+
+    #[test]
+    fn listing_without_balances_never_connects_to_configured_rpc() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for filtered in [false, true] {
+            let mut wallet = listing_wallet();
+            wallet.app.config.rpc.url = Some(format!("http://{}", listener.local_addr().unwrap()));
+            wallet.app.config.rpc.timeout_secs = 1;
+            wallet.app.config.rpc.show_balances = false;
+            let args = if filtered {
+                vec!["test".into()]
+            } else {
+                vec![]
+            };
+            let mut output = Vec::new();
+            list_with_output(&mut wallet.app, &args, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(&format!("test  {}\n", wallet.identity.pubkey)));
+            assert_eq!(output.contains("other  "), !filtered);
+            assert_eq!(output.lines().count(), if filtered { 1 } else { 2 });
+            assert!(!output.contains("SOL:"));
+            assert!(!output.contains("token "));
+            assert!(wallet.app.session.is_none());
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn listing_balances_verifies_cluster_and_queries_only_selected_wallets() {
+        use serde_json::json;
+        for filtered in [false, true] {
+            let mut wallet = listing_wallet();
+            let mint = Pubkey::new_from_array([9; 32]);
+            let token_address = Pubkey::new_from_array([10; 32]);
+            let mut responses = vec![json!(
+                crate::rpc::expected_genesis(&wallet.app.config).unwrap()
+            )];
+            let count = if filtered { 1 } else { 2 };
+            for _ in 0..count {
+                responses.push(json!({"value":1_250_000_000u64}));
+                for program in [TOKEN, TOKEN_2022] {
+                    responses.push(json!({"value":[{
+                        "pubkey":token_address.to_string(),
+                        "account":{"owner":program.to_string(), "data":{"parsed":{"info":{
+                            "mint":mint.to_string(),
+                            "tokenAmount":{"amount":"250", "decimals":2}
+                        }}}}
+                    }]}));
+                }
+            }
+            let (config, server) = crate::test_support::mock_rpc_config(responses);
+            wallet.app.config.rpc = config.rpc;
+            wallet.app.config.rpc.show_balances = true;
+            let args = if filtered {
+                vec!["test".into()]
+            } else {
+                vec![]
+            };
+            let mut output = Vec::new();
+            list_with_output(&mut wallet.app, &args, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.contains("other  "), !filtered);
+            assert_eq!(output.matches("  SOL: 1.25\n").count(), count);
+            assert_eq!(
+                output
+                    .matches(&format!("  token {mint}  2.5  account {token_address}\n"))
+                    .count(),
+                count * 2
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1 + count * 3);
+            assert_eq!(requests[0]["method"], "getGenesisHash");
+            let identities = Session::test_session(&wallet.app.config.vault)
+                .load()
+                .unwrap()
+                .public_snapshot();
+            let selected = identities
+                .accounts
+                .iter()
+                .filter(|a| !filtered || a.name == "test");
+            for (rows, account) in requests[1..].as_chunks::<3>().0.iter().zip(selected) {
+                assert_eq!(rows[0]["method"], "getBalance");
+                for row in rows {
+                    assert_eq!(row["params"][0], account.pubkey.to_string());
+                }
+                for (row, program) in rows[1..].iter().zip([TOKEN, TOKEN_2022]) {
+                    assert_eq!(row["method"], "getTokenAccountsByOwner");
+                    assert_eq!(row["params"][1]["programId"], program.to_string());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn listing_balances_rejects_wrong_cluster_before_querying_accounts() {
+        let mut wallet = listing_wallet();
+        let (config, server) =
+            crate::test_support::mock_rpc_config(vec![serde_json::json!("wrong")]);
+        wallet.app.config.rpc = config.rpc;
+        wallet.app.config.rpc.show_balances = true;
+        let mut output = Vec::new();
+        assert!(
+            list_with_output(&mut wallet.app, &[], &mut output)
+                .unwrap_err()
+                .to_string()
+                .contains("genesis hash")
+        );
+        assert!(output.is_empty());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "getGenesisHash");
+    }
+
+    #[test]
+    fn fixed_keypair_parser_rejects_partial_excess_and_malformed_arrays() {
+        let input = serde_json::to_vec(&vec![7u8; 64]).unwrap();
+        assert_eq!(*parse_keypair_json(&input).unwrap(), [7; 64]);
+        for length in [0, 63, 65] {
+            assert!(parse_keypair_json(&serde_json::to_vec(&vec![7u8; length]).unwrap()).is_err());
+        }
+        for input in [b"[7,7,999]".as_slice(), b"[7,7,", b"null"] {
+            assert!(parse_keypair_json(input).is_err());
+        }
+        let mut trailing = input;
+        trailing.extend_from_slice(b" 0");
+        assert!(parse_keypair_json(&trailing).is_err());
+    }
+
+    #[test]
+    fn token_2022_is_rejected_before_any_approval_or_signing() {
+        assert!(ensure_transfer_program(TOKEN).is_ok());
+        assert!(ensure_transfer_program(TOKEN_2022).is_err());
+        assert!(ensure_transfer_program(SYSTEM).is_err());
+    }
+
+    fn refresh_responses(fee: u64, height: u64) -> Vec<Value> {
+        vec![
+            serde_json::json!({"context":{"slot":100}, "value":{"blockhash":Hash::new_from_array([8; 32]).to_string(),"lastValidBlockHeight":200}}),
+            serde_json::json!({"value":fee}),
+            serde_json::json!({"value":{"err":null}}),
+            serde_json::json!(height),
+        ]
+    }
+
+    #[test]
+    fn refresh_signs_exact_fresh_message_and_retains_the_approved_transfer() {
+        let wallet = crate::test_support::TestWallet::new();
+        let target = Pubkey::new_from_array([9; 32]);
+        let instruction = system_transfer(&wallet.identity.pubkey, &target, 123);
+        let (rpc, server) = crate::test_support::mock_rpc(refresh_responses(5000, 150));
+        let signed = refresh_and_sign(
+            &wallet.app,
+            &rpc,
+            &wallet.identity,
+            &[instruction],
+            5000,
+            0,
+            None,
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "getLatestBlockhash",
+                "getFeeForMessage",
+                "simulateTransaction",
+                "getBlockHeight"
+            ]
+        );
+        assert_eq!(requests[2]["params"][1]["minContextSlot"], 100);
+        assert_eq!(
+            signed.message.recent_blockhash(),
+            &Hash::new_from_array([8; 32])
+        );
+        let VersionedMessage::V0(message) = &signed.message else {
+            panic!()
+        };
+        assert_eq!(&message.instructions[0].data[4..], &123u64.to_le_bytes());
+        let key =
+            ed25519_dalek::VerifyingKey::from_bytes(wallet.identity.pubkey.as_array()).unwrap();
+        key.verify(
+            &wincode::serialize(&signed.message).unwrap(),
+            &ed25519_dalek::Signature::from_bytes(signed.signatures[0].as_array()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signer_is_prepared_before_the_final_height_request() {
+        let wallet = crate::test_support::TestWallet::new();
+        let path = wallet.app.config.vault.clone();
+        let instruction = system_transfer(
+            &wallet.identity.pubkey,
+            &Pubkey::new_from_array([9; 32]),
+            123,
+        );
+        let (rpc, server) =
+            crate::test_support::mock_rpc_with(refresh_responses(5000, 150), move |request| {
+                if request["method"] == "getBlockHeight" {
+                    // Once the final check is requested, signing must no longer depend
+                    // on disk. The old ordering would fail to load this truncated vault.
+                    std::fs::write(&path, []).unwrap();
+                }
+            });
+        let signed = refresh_and_sign(
+            &wallet.app,
+            &rpc,
+            &wallet.identity,
+            &[instruction],
+            5000,
+            0,
+            None,
+        )
+        .unwrap();
+        server.join().unwrap();
+        let key =
+            ed25519_dalek::VerifyingKey::from_bytes(wallet.identity.pubkey.as_array()).unwrap();
+        key.verify(
+            &wincode::serialize(&signed.message).unwrap(),
+            &ed25519_dalek::Signature::from_bytes(signed.signatures[0].as_array()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn changed_fees_expiry_and_changed_identity_prevent_signing() {
+        let mut wallet = crate::test_support::TestWallet::new();
+        let instruction = system_transfer(
+            &wallet.identity.pubkey,
+            &Pubkey::new_from_array([9; 32]),
+            123,
+        );
+        let mut changed_fee = refresh_responses(6000, 150);
+        changed_fee.truncate(2);
+        let (rpc, server) = crate::test_support::mock_rpc(changed_fee);
+        let error = refresh_and_sign(
+            &wallet.app,
+            &rpc,
+            &wallet.identity,
+            std::slice::from_ref(&instruction),
+            5000,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fee or rent changed"));
+        server.join().unwrap();
+        let (rpc, server) = crate::test_support::mock_rpc(refresh_responses(5000, 199));
+        assert!(
+            refresh_and_sign(
+                &wallet.app,
+                &rpc,
+                &wallet.identity,
+                std::slice::from_ref(&instruction),
+                5000,
+                0,
+                None
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("expiry")
+        );
+        server.join().unwrap();
+        wallet.identity.pubkey = Pubkey::new_from_array([11; 32]);
+        let instruction = system_transfer(
+            &wallet.identity.pubkey,
+            &Pubkey::new_from_array([9; 32]),
+            123,
+        );
+        let mut responses = refresh_responses(5000, 150);
+        responses.truncate(3); // Identity validation precedes the final height request.
+        let (rpc, server) = crate::test_support::mock_rpc(responses);
+        assert!(
+            refresh_and_sign(
+                &wallet.app,
+                &rpc,
+                &wallet.identity,
+                &[instruction],
+                5000,
+                0,
+                None
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn export_requires_exactly_one_supported_format() {
         for args in [
             vec![],
@@ -1508,10 +2149,10 @@ mod tests {
     #[test]
     fn private_key_exports_round_trip_for_derived_and_imported_wallets() {
         let mut data = vault::Vault::default();
-        data.add_master("main", Zeroizing::new(vec![0; 32]))
+        data.add_master("main", LockedBytes::from_slice(&[0; 32]).unwrap())
             .unwrap();
-        data.add_derived("child").unwrap();
-        let imported = Keypair::new_from_array([7; 32]).to_keypair_bytes();
+        data.add_derived("child", "main").unwrap();
+        let imported = Keypair::new_from_array([7; 32]).to_keypair_bytes().unwrap();
         data.add_imported("imported", imported).unwrap();
         for name in ["main", "child", "imported"] {
             let mut output = Vec::new();
@@ -1537,7 +2178,10 @@ mod tests {
                 .next()
                 .unwrap();
             let bytes = decode_base58_keypair(key).unwrap();
-            assert_eq!(*bytes, *data.signer(name).unwrap().to_keypair_bytes());
+            assert_eq!(
+                *bytes,
+                *data.signer(name).unwrap().to_keypair_bytes().unwrap()
+            );
             assert_eq!(
                 Keypair::try_from(&bytes[..]).unwrap().pubkey(),
                 data.account(name).unwrap().pubkey
@@ -1552,9 +2196,9 @@ mod tests {
     #[test]
     fn mnemonic_export_shows_the_selected_wallet_path() {
         let mut data = vault::Vault::default();
-        data.add_master("main", Zeroizing::new(vec![0; 32]))
+        data.add_master("main", LockedBytes::from_slice(&[0; 32]).unwrap())
             .unwrap();
-        data.add_derived("child").unwrap();
+        data.add_derived("child", "main").unwrap();
         let mut output = Vec::new();
         export_wallet(
             &data,
@@ -1574,15 +2218,16 @@ mod tests {
     #[test]
     fn export_cancellation_and_unavailable_secrets_never_reveal_keys() {
         let mut data = vault::Vault::default();
-        data.add_master("main", Zeroizing::new(vec![0; 32]))
+        data.add_master("main", LockedBytes::from_slice(&[0; 32]).unwrap())
             .unwrap();
         data.add_imported(
             "imported",
-            Keypair::new_from_array([7; 32]).to_keypair_bytes(),
+            Keypair::new_from_array([7; 32]).to_keypair_bytes().unwrap(),
         )
         .unwrap();
         let expected_key =
-            bs58::encode(&data.signer("main").unwrap().to_keypair_bytes()[..]).into_string();
+            bs58::encode(&data.signer("main").unwrap().to_keypair_bytes().unwrap()[..])
+                .into_string();
         for kind in [ExportKind::PrivateKey, ExportKind::Mnemonic] {
             for answer in [None, Some("wrong".into())] {
                 let mut output = Vec::new();
@@ -1659,7 +2304,7 @@ mod tests {
     fn deletion_confirms_name_and_only_offers_erasure_for_unused_phrases() {
         let mut vault = vault::Vault::default();
         vault
-            .add_master("main", Zeroizing::new(vec![0; 32]))
+            .add_master("main", LockedBytes::from_slice(&[0; 32]).unwrap())
             .unwrap();
         assert!(confirm_delete(&vault, "main", || Ok(None)).is_err());
         assert!(confirm_delete(&vault, "main", || Ok(Some("wrong".into()))).is_err());
@@ -1670,7 +2315,7 @@ mod tests {
         let mut closed = [Some("main".into()), None].into_iter();
         assert!(confirm_delete(&vault, "main", || Ok(closed.next().unwrap())).is_err());
         assert!(vault.contains("main")); // Prompts/cancellation do not mutate the vault.
-        vault.add_derived("child").unwrap();
+        vault.add_derived("child", "main").unwrap();
         let mut calls = 0;
         assert!(
             !confirm_delete(&vault, "main", || {
@@ -1732,7 +2377,6 @@ mod tests {
             mint,
             raw_amount,
             decimals: 6,
-            display_amount: "0".into(),
         };
         assert!(matches!(
             close_eligibility(&owner, TOKEN, account(address, 0), false),

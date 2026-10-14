@@ -13,11 +13,23 @@ pub struct CommandHistory {
 
 impl CommandHistory {
     pub fn read_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
+        self.read_line_with_interrupt(prompt, false)
+    }
+
+    pub fn read_edit_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
+        self.read_line_with_interrupt(prompt, true)
+    }
+
+    fn read_line_with_interrupt(
+        &mut self,
+        prompt: &str,
+        cancel: bool,
+    ) -> io::Result<Option<String>> {
         #[cfg(unix)]
         if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
             && unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
         {
-            return self.read_tty_line(prompt);
+            return self.read_tty_line(prompt, cancel);
         }
         crate::read_bounded_line()
     }
@@ -270,7 +282,11 @@ mod terminal {
     }
 
     impl CommandHistory {
-        pub(super) fn read_tty_line(&mut self, prompt: &str) -> io::Result<Option<String>> {
+        pub(super) fn read_tty_line(
+            &mut self,
+            prompt: &str,
+            cancel: bool,
+        ) -> io::Result<Option<String>> {
             let _mode = ModeGuard::enter()?;
             self.position = None;
             self.draft.zeroize();
@@ -303,6 +319,12 @@ mod terminal {
                     }
                     Some(3) => {
                         output.write_all(b"^C\r\n")?;
+                        if cancel {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "settings edit cancelled",
+                            ));
+                        }
                         return Ok(Some(String::new()));
                     }
                     Some(8 | 127) => {
@@ -509,10 +531,10 @@ mod tests {
     #[test]
     fn recalls_recent_commands_and_restores_draft() {
         let mut history = CommandHistory::default();
-        history.remember("list --wallet main", &[]);
+        history.remember("list main", &[]);
         history.remember("history --wallet main", &[]);
         assert_eq!(history.older("unfinished"), Some("history --wallet main"));
-        assert_eq!(history.older(""), Some("list --wallet main"));
+        assert_eq!(history.older(""), Some("list main"));
         assert_eq!(history.newer(), Some("history --wallet main"));
         assert_eq!(history.newer(), Some("unfinished"));
     }
